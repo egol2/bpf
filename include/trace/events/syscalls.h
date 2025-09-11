@@ -65,10 +65,33 @@ TRACE_EVENT_SYSCALL(sys_exit,
 
 TRACE_EVENT_FLAGS(sys_exit, TRACE_EVENT_FL_CAP_ANY)
 
+TRACE_EVENT_FN(sys_saterm_test,
+
+	TP_PROTO(struct pt_regs *regs, long ret),
+
+	TP_ARGS(regs, ret),
+
+	TP_STRUCT__entry(
+		__field(	long,	id	)
+		__field(	long,	ret	)
+	),
+
+	TP_fast_assign(
+		__entry->id	= syscall_get_nr(current, regs);
+		__entry->ret	= ret;
+	),
+
+	TP_printk("NR %ld = %ld",
+		  __entry->id, __entry->ret),
+
+	syscall_regfunc, syscall_unregfunc
+);
+
+TRACE_EVENT_FLAGS(sys_saterm_test, TRACE_EVENT_FL_CAP_ANY)
+
 #endif /* CONFIG_HAVE_SYSCALL_TRACEPOINTS */
 
 #endif /* _TRACE_EVENTS_SYSCALLS_H */
 
 /* This part must be outside protection */
 #include <trace/define_trace.h>
-
