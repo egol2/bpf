@@ -3938,6 +3938,9 @@ void bpf_prog_termination_deferred(struct work_struct *work)
 	struct bpf_prog *prog = term_states->prog;
 
 	bpf_die(prog);
+	
+	if(prog->aux->uterm_signal)
+		bpf_prog_put(prog);
 }
 
 static struct workqueue_struct *bpf_termination_wq;

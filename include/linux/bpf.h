@@ -1636,6 +1636,7 @@ struct bpf_prog_aux {
 	bool attach_btf_trace; /* true if attaching to BTF-enabled raw tp */
 	bool attach_tracing_prog; /* true if tracing another tracing program */
 	bool func_proto_unreliable;
+	bool uterm_signal;
 	bool tail_call_reachable;
 	bool xdp_has_frags;
 	bool exception_cb;

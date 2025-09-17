@@ -6000,6 +6000,7 @@ static int bpf_prog_terminate(union bpf_attr *attr)
 	if (atomic_cmpxchg(&prog->term_states->bpf_die_in_progress, 0, 1))
 		return -EBUSY;
 	
+	prog->aux->uterm_signal = true;
 	bpf_termination_wq = alloc_workqueue("bpf_termination_wq", WQ_UNBOUND, 1);
 	if (!bpf_termination_wq)
 		pr_err("Failed to alloc workqueue for bpf termination.\n");
