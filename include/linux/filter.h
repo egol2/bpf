@@ -78,6 +78,9 @@ struct ctl_table_header;
 /* unused opcode to mark special atomic instruction */
 #define BPF_PROBE_ATOMIC 0xe0
 
+/* unused opcode to mark special ldsx instruction. Same as BPF_NOSPEC */
+#define BPF_PROBE_MEM32SX 0xc0
+
 /* unused opcode to mark call to interpreter with arguments */
 #define BPF_CALL_ARGS	0xe0
 
@@ -1816,7 +1819,7 @@ static inline void bpf_xdp_copy_buf(struct xdp_buff *xdp, unsigned long off, voi
 
 static inline void *bpf_skb_meta_pointer(struct sk_buff *skb, u32 offset)
 {
-	return NULL;
+	return ERR_PTR(-EOPNOTSUPP);
 }
 #endif /* CONFIG_NET */
 
