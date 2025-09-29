@@ -93,7 +93,6 @@ obj-$(CONFIG_RUST)	+= rust/
 obj-y			+= $(ARCH_LIB)
 obj-y			+= drivers/
 obj-y			+= sound/
-obj-y			+= saterm/
 obj-$(CONFIG_SAMPLES)	+= samples/
 obj-$(CONFIG_NET)	+= net/
 obj-y			+= virt/
