@@ -2859,6 +2859,14 @@ static void bpf_free_used_btfs(struct bpf_prog_aux *aux)
 	kfree(aux->used_btfs);
 }
 
+void bpf_exception_frame_desc_tab_free(struct bpf_exception_frame_desc_tab *fdtab)
+{
+	if (!fdtab)
+		return;
+	for (int i = 0; i < fdtab->cnt; i++)
+		kfree(fdtab->desc[i]);
+}
+
 static void bpf_prog_free_deferred(struct work_struct *work)
 {
 	struct bpf_prog_aux *aux;
@@ -2873,6 +2881,11 @@ static void bpf_prog_free_deferred(struct work_struct *work)
 	if (aux->cgroup_atype != CGROUP_BPF_ATTACH_TYPE_INVALID)
 		bpf_cgroup_atype_put(aux->cgroup_atype);
 #endif
+	/* Free all exception frame descriptors */
+	for (int i = 0; i < aux->func_cnt; i++) {
+		bpf_exception_frame_desc_tab_free(aux->func[i]->aux->fdtab);
+		aux->func[i]->aux->fdtab = NULL;
+	}
 	bpf_free_used_maps(aux);
 	bpf_free_used_btfs(aux);
 	if (bpf_prog_is_dev_bound(aux))
@@ -3146,6 +3159,11 @@ int __weak bpf_arch_text_invalidate(void *dst, size_t len)
 }
 
 bool __weak bpf_jit_supports_exceptions(void)
+{
+	return false;
+}
+
+bool __weak bpf_jit_supports_exceptions_cleanup(void)
 {
 	return false;
 }

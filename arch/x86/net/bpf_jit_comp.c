@@ -768,9 +768,10 @@ static void emit_bpf_tail_call_indirect(struct bpf_prog *bpf_prog,
 	/* Inc tail_call_cnt if the slot is populated. */
 	EMIT4(0x48, 0x83, 0x00, 0x01);            /* add qword ptr [rax], 1 */
 
-	if (bpf_prog->aux->exception_boundary) {
+	if (bpf_prog->aux->exception_boundary || bpf_prog->aux->bpf_throw_tramp) {
 		pop_callee_regs(&prog, all_callee_regs_used);
-		pop_r12(&prog);
+		if (bpf_prog->aux->exception_boundary)
+			pop_r12(&prog);
 	} else {
 		pop_callee_regs(&prog, callee_regs_used);
 		if (bpf_arena_get_kern_vm_start(bpf_prog->aux->arena))
@@ -835,9 +836,10 @@ static void emit_bpf_tail_call_direct(struct bpf_prog *bpf_prog,
 	/* Inc tail_call_cnt if the slot is populated. */
 	EMIT4(0x48, 0x83, 0x00, 0x01);                /* add qword ptr [rax], 1 */
 
-	if (bpf_prog->aux->exception_boundary) {
+	if (bpf_prog->aux->exception_boundary || bpf_prog->aux->bpf_throw_tramp) {
 		pop_callee_regs(&prog, all_callee_regs_used);
-		pop_r12(&prog);
+		if (bpf_prog->aux->exception_boundary)
+			pop_r12(&prog);
 	} else {
 		pop_callee_regs(&prog, callee_regs_used);
 		if (bpf_arena_get_kern_vm_start(bpf_prog->aux->arena))
@@ -1664,12 +1666,9 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 	/* Exception callback will clobber callee regs for its own use, and
 	 * restore the original callee regs from main prog's stack frame.
 	 */
-	if (bpf_prog->aux->exception_boundary) {
-		/* We also need to save r12, which is not mapped to any BPF
-		 * register, as we throw after entry into the kernel, which may
-		 * overwrite r12.
-		 */
-		push_r12(&prog);
+	if (bpf_prog->aux->exception_boundary || bpf_prog->aux->bpf_throw_tramp) {
+		if (bpf_prog->aux->exception_boundary)
+			push_r12(&prog);
 		push_callee_regs(&prog, all_callee_regs_used);
 	} else {
 		if (arena_vm_start)
@@ -2707,9 +2706,10 @@ emit_jmp:
 				if (emit_spectre_bhb_barrier(&prog, ip, bpf_prog))
 					return -EINVAL;
 			}
-			if (bpf_prog->aux->exception_boundary) {
+			if (bpf_prog->aux->exception_boundary || bpf_prog->aux->bpf_throw_tramp) {
 				pop_callee_regs(&prog, all_callee_regs_used);
-				pop_r12(&prog);
+				if (bpf_prog->aux->exception_boundary)
+					pop_r12(&prog);
 			} else {
 				pop_callee_regs(&prog, callee_regs_used);
 				if (arena_vm_start)
@@ -3841,6 +3841,17 @@ out_image:
 		prog = orig_prog;
 	}
 
+	if (prog->aux->fdtab && !prog->aux->fdtab->final && image) {
+		struct bpf_exception_frame_desc_tab *fdtab = prog->aux->fdtab;
+
+		for (int i = 0; i < fdtab->cnt; i++) {
+			struct bpf_exception_frame_desc *desc = fdtab->desc[i];
+
+			desc->pc = addrs[desc->pc];
+		}
+		prog->aux->fdtab->final = true;
+	}
+
 	if (!image || !prog->is_func || extra_pass) {
 		if (image)
 			bpf_prog_fill_jited_linfo(prog, addrs + 1);
@@ -3928,6 +3939,11 @@ bool bpf_jit_supports_exceptions(void)
 	return IS_ENABLED(CONFIG_UNWINDER_ORC);
 }
 
+bool bpf_jit_supports_exceptions_cleanup(void)
+{
+	return bpf_jit_supports_exceptions();
+}
+
 bool bpf_jit_supports_private_stack(void)
 {
 	return true;
@@ -3947,6 +3963,82 @@ void arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp, u64 bp
 	}
 	return;
 #endif
+}
+
+static int bpf_frame_spilled_caller_reg_off(struct bpf_prog *prog, int regno)
+{
+	int off = 0;
+
+	for (int i = BPF_REG_9; i >= BPF_REG_6; i--) {
+		if (regno == i)
+			return off;
+		if (prog->aux->callee_regs_used[i - BPF_REG_6])
+			off += sizeof(u64);
+	}
+	WARN_ON_ONCE(1);
+	return 0;
+}
+
+void arch_bpf_cleanup_frame_resource(struct bpf_prog *prog, struct bpf_throw_ctx *ctx, u64 ip, u64 sp, u64 bp) {
+	struct bpf_exception_frame_desc_tab *fdtab = prog->aux->fdtab;
+	struct bpf_exception_frame_desc *fd = NULL;
+	u64 ip_off = ip - (u64)prog->bpf_func;
+
+	/* Hidden subprogs and subprogs without fdtab do not need cleanup. */
+	if (bpf_is_hidden_subprog(prog) || !fdtab)
+		goto end;
+
+	for (int i = 0; i < fdtab->cnt; i++) {
+		if (ip_off != fdtab->desc[i]->pc)
+			continue;
+		fd = fdtab->desc[i];
+		break;
+	}
+	/* This should always be found, but let's bail if we cannot find it. */
+	if (WARN_ON_ONCE(!fd))
+		return;
+
+	for (int i = 0; i < fd->stack_cnt; i++) {
+		void *ptr = (void *)((s64)bp + fd->stack[i].off);
+
+		bpf_cleanup_resource(fd->stack + i, ptr);
+	}
+
+	for (int i = 0; i < ARRAY_SIZE(fd->regs); i++) {
+		void *ptr;
+
+		if (!fd->regs[i].regno || fd->regs[i].type == NOT_INIT || fd->regs[i].type == SCALAR_VALUE)
+			continue;
+		/* Our sp will be bp of new frame before caller regs are spilled, so offset is relative to our sp. */
+		WARN_ON_ONCE(!ctx->saved_reg[i]);
+		ptr = (void *)&ctx->saved_reg[i];
+		bpf_cleanup_resource(fd->regs + i, ptr);
+		ctx->saved_reg[i] = 0;
+	}
+end:
+	/* There could be a case where we have something in main R6, R7, R8, R9 that
+	 * needs releasing, and the callchain is as follows:
+	 * main -> subprog1 -> subprog2 -> bpf_throw_tramp -> bpf_throw
+	 * In such a case, subprog1 may use only R6, R7 and subprog2 may use R8, R9 being unscratched until
+	 * subprog2 calls bpf_throw. In that case, subprog2 will spill R6-R9. The
+	 * loop below when we are called for each subprog in order will ensure we have the correct saved_reg
+	 * from the PoV of the current bpf_prog corresponding to a frame.
+	 * E.g. in the chain main -> s1 -> s2 -> bpf_throw_tramp -> bpf_throw
+	 * Let's say R6-R9 have values A, B, C, D in main when calling subprog1.
+	 * Below, we show the computed saved_regs values as we walk the stack:
+	 * For bpf_throw_tramp, saved_regs = { 0, 0, 0, 0 }
+	 * For s2, saved_regs = { 0, 0, 0, D } // D loaded from bpf_throw_tramp frame
+	 * For s1, saved_regs = { 0, 0, C, D } // C loaded from subprog2 frame
+	 * For main, saved_regs = { A, B, C, D } // A, B loaded from subprog1 frame
+	 * Thus, for main, we have the correct saved_regs values even though they
+	 * were spilled in multiple callee stack frames down the call chain.
+	 */
+	if (bpf_is_subprog(prog)) {
+		for (int i = 0; i < ARRAY_SIZE(prog->aux->callee_regs_used); i++) {
+			if (prog->aux->callee_regs_used[i])
+				ctx->saved_reg[i] = *(u64 *)((s64)sp + bpf_frame_spilled_caller_reg_off(prog, BPF_REG_6 + i));
+		}
+	}
 }
 
 void bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,

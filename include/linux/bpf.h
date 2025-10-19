@@ -1567,6 +1567,7 @@ struct btf_mod_pair {
 };
 
 struct bpf_kfunc_desc_tab;
+struct bpf_exception_frame_desc_tab;
 
 enum bpf_stream_id {
 	BPF_STDOUT = 1,
@@ -1634,6 +1635,8 @@ struct bpf_prog_aux {
 	bool xdp_has_frags;
 	bool exception_cb;
 	bool exception_boundary;
+	bool bpf_throw_tramp;
+	bool callee_regs_used[4];
 	bool is_extended; /* true if extended by freplace program */
 	bool jits_use_priv_stack;
 	bool priv_stack_requested;
@@ -1705,6 +1708,7 @@ struct bpf_prog_aux {
 	struct module *mod;
 	u32 num_exentries;
 	struct exception_table_entry *extable;
+	struct bpf_exception_frame_desc_tab *fdtab;
 	union {
 		struct work_struct work;
 		struct rcu_head	rcu;
@@ -3763,6 +3767,59 @@ static inline bool bpf_is_subprog(const struct bpf_prog *prog)
 {
 	return prog->aux->func_idx != 0;
 }
+
+static inline bool bpf_is_hidden_subprog(const struct bpf_prog *prog)
+{
+	return prog->aux->func_idx >= prog->aux->func_cnt;
+}
+
+struct bpf_frame_desc_reg_entry {
+	u32 type;
+	s16 spill_type;
+	union {
+		s16 off;
+		u16 regno;
+	};
+	struct btf *btf;
+	u32 btf_id;
+};
+
+struct bpf_exception_frame_desc {
+	u64 pc;
+	u32 stack_cnt;
+	struct bpf_frame_desc_reg_entry regs[4];
+	struct bpf_frame_desc_reg_entry stack[];
+};
+
+struct bpf_exception_frame_desc_tab {
+	u32 cnt;
+	bool final;
+	struct bpf_exception_frame_desc **desc;
+};
+
+void bpf_exception_frame_desc_tab_free(struct bpf_exception_frame_desc_tab *fdtab);
+
+struct bpf_throw_ctx {
+	struct bpf_prog_aux *aux;
+	u64 sp;
+	u64 bp;
+	union {
+		struct {
+			u64 saved_r6;
+			u64 saved_r7;
+			u64 saved_r8;
+			u64 saved_r9;
+		};
+		u64 saved_reg[4];
+	};
+	int cnt;
+};
+
+void arch_bpf_cleanup_frame_resource(struct bpf_prog *prog, struct bpf_throw_ctx *ctx, u64 ip, u64 sp, u64 bp);
+void bpf_cleanup_resource(struct bpf_frame_desc_reg_entry *fd, void *ptr);
+int bpf_cleanup_resource_reg(struct bpf_frame_desc_reg_entry *fd, void *ptr);
+int bpf_cleanup_resource_dynptr(struct bpf_frame_desc_reg_entry *fd, void *ptr);
+int bpf_cleanup_resource_iter(struct bpf_frame_desc_reg_entry *fd, void *ptr);
 
 int bpf_prog_get_file_line(struct bpf_prog *prog, unsigned long ip, const char **filep,
 			   const char **linep, int *nump);
