@@ -11588,7 +11588,7 @@ static int gen_exception_frame_descs(struct bpf_verifier_env *env)
 }
 
 
-static int check_reference_leak(struct bpf_verifier_env *env)
+static int check_reference_leak(struct bpf_verifier_env *env, bool exception_exit)
 {
 	struct bpf_verifier_state *state = env->cur_state;
 	enum bpf_prog_type type = resolve_prog_type(env->prog);
@@ -11596,8 +11596,7 @@ static int check_reference_leak(struct bpf_verifier_env *env)
 	bool refs_lingering = false;
 	int i;
 
-	// if (!exception_exit && cur_func(env)->frameno)
-	if (state->frameno && !state->in_callback_fn)
+	if (!exception_exit && cur_func(env)->frameno)
 		return 0;
 
 	for (i = 0; i < state->acquired_refs; i++) {
@@ -11606,8 +11605,6 @@ static int check_reference_leak(struct bpf_verifier_env *env)
 		/* Allow struct_ops programs to return a referenced kptr back to
 		 * kernel. Type checks are performed later in check_return_code.
 		 */
-		if (state->in_callback_fn && state->refs[i].callback_ref != state->frameno)
-			continue;
 		verbose(env, "Unreleased reference id=%d alloc_insn=%d\n",
 			state->refs[i].id, state->refs[i].insn_idx);
 		refs_lingering = true;
@@ -11624,7 +11621,7 @@ static int check_resource_leak(struct bpf_verifier_env *env, bool exception_exit
 		return -EINVAL;
 	}
 
-	err = check_reference_leak(env);
+	err = check_reference_leak(env, false);
 	if (err) {
 		verbose(env, "%s would lead to reference leak\n", prefix);
 		return err;
@@ -20385,8 +20382,7 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 					err = gen_exception_frame_descs(env);
 					if (err < 0)
 						return err;
-					exception_exit = true;
-					goto process_bpf_exit_full;
+					return process_bpf_exit_full(env, do_print_state, true);
 				}
 			} else if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
 				err = check_kfunc_call(env, insn, &env->insn_idx);
@@ -21542,7 +21538,7 @@ static int verifier_remove_insns(struct bpf_verifier_env *env, u32 off, u32 cnt)
 
 	err = adjust_subprog_frame_descs_after_remove(env, off, cnt);
 	if (err)
-		return errs
+		return err;
 
 	err = bpf_adj_linfo_after_remove(env, off, cnt);
 	if (err)
