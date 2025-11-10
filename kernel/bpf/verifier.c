@@ -11588,15 +11588,13 @@ static int gen_exception_frame_descs(struct bpf_verifier_env *env)
 }
 
 
-static int check_reference_leak(struct bpf_verifier_env *env, bool exception_exit)
+static int check_reference_leak(struct bpf_verifier_env *env)
 {
 	struct bpf_verifier_state *state = env->cur_state;
-	enum bpf_prog_type type = resolve_prog_type(env->prog);
-	struct bpf_reg_state *reg = reg_state(env, BPF_REG_0);
 	bool refs_lingering = false;
 	int i;
 
-	if (!exception_exit && cur_func(env)->frameno)
+	if (cur_func(env)->frameno && !cur_func(env)->in_callback_fn)
 		return 0;
 
 	for (i = 0; i < state->acquired_refs; i++) {
@@ -11621,7 +11619,7 @@ static int check_resource_leak(struct bpf_verifier_env *env, bool exception_exit
 		return -EINVAL;
 	}
 
-	err = check_reference_leak(env, false);
+	err = check_reference_leak(env);
 	if (err) {
 		verbose(env, "%s would lead to reference leak\n", prefix);
 		return err;
