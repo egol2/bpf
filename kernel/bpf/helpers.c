@@ -28,6 +28,8 @@
 #include <linux/uaccess.h>
 #include <linux/verification.h>
 #include <linux/task_work.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 #include <linux/irq_work.h>
 
 #include "../../lib/kstrtox.h"
@@ -3116,24 +3118,158 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 	return bpf_is_subprog(prog);
 }
 
+/* Per-CPU statistics for bpf_throw instrumentation */
+struct bpf_throw_stats {
+	u64 call_count;
+	u64 total_time_ns;
+	u64 stack_walk_time_ns;
+	u64 last_call_time_ns;
+};
+
+static DEFINE_PER_CPU(struct bpf_throw_stats, bpf_throw_stats);
+
 __bpf_kfunc void bpf_throw(u64 cookie)
 {
 	struct bpf_throw_ctx ctx = {};
+	u64 start_time, stack_walk_start, stack_walk_end;
+	struct bpf_throw_stats *stats;
 
+	/* Record start time */
+	start_time = ktime_get_ns();
+	
+	/* Get per-CPU stats */
+	stats = this_cpu_ptr(&bpf_throw_stats);
+	stats->call_count++;
+
+	/* Measure stack walk */
+	stack_walk_start = ktime_get_ns();
 	arch_bpf_stack_walk(bpf_stack_walker, &ctx);
+	stack_walk_end = ktime_get_ns();
+	
+	stats->stack_walk_time_ns += (stack_walk_end - stack_walk_start);
+	
 	WARN_ON_ONCE(!ctx.aux);
 	if (ctx.aux)
 		WARN_ON_ONCE(!ctx.aux->exception_boundary);
 	WARN_ON_ONCE(!ctx.bp);
 	WARN_ON_ONCE(!ctx.cnt);
+	
 	/* Prevent KASAN false positives for CONFIG_KASAN_STACK by unpoisoning
 	 * deeper stack depths than ctx.sp as we do not return from bpf_throw,
 	 * which skips compiler generated instrumentation to do the same.
 	 */
 	kasan_unpoison_task_stack_below((void *)(long)ctx.sp);
+	
+	/* Record time before callback (callback doesn't return) */
+	stats->last_call_time_ns = ktime_get_ns() - start_time;
+	stats->total_time_ns += stats->last_call_time_ns;
+	
+	/* Optional: trace_printk for debugging */
+	// trace_printk("bpf_throw: %llu ns (stack_walk: %llu ns)\n", 
+	//              stats->last_call_time_ns, stack_walk_end - stack_walk_start);
+	
 	ctx.aux->bpf_exception_cb(cookie, ctx.sp, ctx.bp, 0, 0);
 	WARN(1, "A call to BPF exception callback should never return\n");
 }
+
+/* Proc file interface for bpf_throw statistics */
+static int bpf_throw_stats_show(struct seq_file *m, void *v)
+{
+	int cpu;
+	u64 total_calls = 0;
+	u64 total_time = 0;
+	u64 total_stack_walk_time = 0;
+	
+	seq_printf(m, "Per-CPU bpf_throw() statistics:\n");
+	seq_printf(m, "%-4s %12s %16s %20s %16s\n", 
+		   "CPU", "Calls", "Total_ns", "Avg_ns", "StackWalk_ns");
+	
+	for_each_possible_cpu(cpu) {
+		struct bpf_throw_stats *stats = per_cpu_ptr(&bpf_throw_stats, cpu);
+		u64 avg_ns = stats->call_count ? stats->total_time_ns / stats->call_count : 0;
+		
+		if (stats->call_count > 0) {
+			seq_printf(m, "%-4d %12llu %16llu %20llu %16llu\n",
+				   cpu, stats->call_count, stats->total_time_ns,
+				   avg_ns, stats->stack_walk_time_ns);
+			
+			total_calls += stats->call_count;
+			total_time += stats->total_time_ns;
+			total_stack_walk_time += stats->stack_walk_time_ns;
+		}
+	}
+	
+	if (total_calls > 0) {
+		u64 overall_avg = total_time / total_calls;
+		u64 stack_walk_avg = total_stack_walk_time / total_calls;
+		
+		seq_printf(m, "\nOverall statistics:\n");
+		seq_printf(m, "  Total calls:           %llu\n", total_calls);
+		seq_printf(m, "  Total time:            %llu ns\n", total_time);
+		seq_printf(m, "  Average per call:      %llu ns\n", overall_avg);
+		seq_printf(m, "  Avg stack walk time:   %llu ns\n", stack_walk_avg);
+		seq_printf(m, "  Avg other overhead:    %llu ns\n", overall_avg - stack_walk_avg);
+	}
+	
+	return 0;
+}
+
+static int bpf_throw_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, bpf_throw_stats_show, NULL);
+}
+
+static ssize_t bpf_throw_stats_write(struct file *file, const char __user *buf,
+				      size_t count, loff_t *ppos)
+{
+	int cpu;
+	char input[16];
+	
+	if (count >= sizeof(input))
+		return -EINVAL;
+	
+	if (copy_from_user(input, buf, count))
+		return -EFAULT;
+	
+	input[count] = '\0';
+	
+	/* Writing "reset" clears the statistics */
+	if (strncmp(input, "reset", 5) == 0) {
+		for_each_possible_cpu(cpu) {
+			struct bpf_throw_stats *stats = per_cpu_ptr(&bpf_throw_stats, cpu);
+			stats->call_count = 0;
+			stats->total_time_ns = 0;
+			stats->stack_walk_time_ns = 0;
+			stats->last_call_time_ns = 0;
+		}
+		pr_info("bpf_throw statistics reset\n");
+	}
+	
+	return count;
+}
+
+static const struct proc_ops bpf_throw_stats_ops = {
+	.proc_open	= bpf_throw_stats_open,
+	.proc_read	= seq_read,
+	.proc_write	= bpf_throw_stats_write,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+};
+
+static int __init bpf_throw_stats_init(void)
+{
+	struct proc_dir_entry *entry;
+	
+	entry = proc_create("bpf_throw_stats", 0644, NULL, &bpf_throw_stats_ops);
+	if (!entry) {
+		pr_err("Failed to create /proc/bpf_throw_stats\n");
+		return -ENOMEM;
+	}
+	
+	pr_info("BPF throw statistics available at /proc/bpf_throw_stats\n");
+	return 0;
+}
+fs_initcall(bpf_throw_stats_init);
 
 __bpf_kfunc int bpf_wq_init(struct bpf_wq *wq, void *p__map, unsigned int flags)
 {
