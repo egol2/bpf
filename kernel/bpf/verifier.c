@@ -12759,6 +12759,22 @@ static bool is_bpf_res_spin_lock_kfunc(u32 btf_id)
 	       btf_id == special_kfunc_list[KF_bpf_res_spin_unlock_irqrestore];
 }
 
+static bool is_bpf_res_spin_llock_kfunc(u32 btf_id)
+{
+	return btf_id == special_kfunc_list[KF_bpf_res_spin_lock] ||
+	       btf_id == special_kfunc_list[KF_bpf_res_spin_lock_irqsave];
+}
+
+static bool is_bpf_map_helper(__s32 func_id)
+{
+	return func_id == BPF_FUNC_map_update_elem ||
+	       func_id == BPF_FUNC_map_delete_elem ||
+	       func_id == BPF_FUNC_map_push_elem ||
+	       func_id == BPF_FUNC_map_pop_elem ||
+	       func_id == BPF_FUNC_map_peek_elem;
+
+}
+
 static bool kfunc_spin_allowed(u32 btf_id)
 {
 	return is_bpf_graph_api_kfunc(btf_id) || is_bpf_iter_num_api_kfunc(btf_id) ||
@@ -21959,8 +21975,10 @@ static int fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	}
 
 	if (!bpf_jit_supports_far_kfunc_call()) {
-		if (meta.kfunc_flags & KF_RET_NULL)
+		if ((meta.kfunc_flags & KF_RET_NULL)  ||
+			(is_bpf_res_spin_llock_kfunc(insn->imm))) {
 			*kfunc_btf_id = insn->imm;
+		} 
 		insn->imm = BPF_CALL_IMM(desc->addr);
 	}
 	if (insn->off)
@@ -22451,7 +22469,11 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 store_call_indices:
 			if (kfunc_btf_id != 0) {
 				call_states[call_sites_cnt].call_bpf_insn_idx = i + delta;
-				call_states[call_sites_cnt].is_helper_kfunc = 1;
+				if (is_bpf_res_spin_llock_kfunc(kfunc_btf_id)) {
+					call_states[call_sites_cnt].is_helper_kfunc_ret_non_zero = 1;
+				} else {
+					call_states[call_sites_cnt].is_helper_kfunc = 1;
+				}
 				call_sites_cnt++;
 			}
 			goto next_insn;
@@ -22933,12 +22955,17 @@ patch_call_imm:
 			return -EFAULT;
 		}
 
-		if ((fn->ret_type & PTR_MAYBE_NULL) || is_bpf_loop_call(insn)) {
+		if ((fn->ret_type & PTR_MAYBE_NULL) ||
+			 is_bpf_loop_call(insn) ||
+			 insn->imm == BPF_FUNC_trace_printk) {
 			call_states[call_sites_cnt].call_bpf_insn_idx = i + delta;	
 			if (is_bpf_loop_call(insn))
 				call_states[call_sites_cnt].is_bpf_loop = 1;
+			else if (insn->imm == BPF_FUNC_trace_printk || is_bpf_map_helper(insn->imm))
+				call_states[call_sites_cnt].is_helper_kfunc_ret_non_zero = 1;
 			else
 				call_states[call_sites_cnt].is_helper_kfunc = 1;
+
 			call_sites_cnt++;
 		}
 		insn->imm = fn->func - __bpf_call_base;

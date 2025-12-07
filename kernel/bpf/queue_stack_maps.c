@@ -5,6 +5,7 @@
  * Copyright (c) 2018 Politecnico di Torino
  */
 #include <linux/bpf.h>
+#include <linux/filter.h>
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <linux/btf_ids.h>
@@ -95,12 +96,16 @@ static void queue_stack_map_free(struct bpf_map *map)
 static long __queue_map_get(struct bpf_map *map, void *value, bool delete)
 {
 	struct bpf_queue_stack *qs = bpf_queue_stack(map);
+	struct bpf_term_ctx ctx;
 	unsigned long flags;
 	int err = 0;
 	void *ptr;
 
-	if (raw_res_spin_lock_irqsave(&qs->lock, flags))
+	if (raw_res_spin_lock_irqsave(&qs->lock, flags)) {
+		ctx.deadlock = 1;
+		arch_bpf_stack_walk(bpf_term_stack_walker, &ctx);
 		return -EBUSY;
+	}
 
 	if (queue_stack_map_is_empty(qs)) {
 		memset(value, 0, qs->map.value_size);
@@ -125,13 +130,17 @@ out:
 static long __stack_map_get(struct bpf_map *map, void *value, bool delete)
 {
 	struct bpf_queue_stack *qs = bpf_queue_stack(map);
+	struct bpf_term_ctx ctx;
 	unsigned long flags;
 	int err = 0;
 	void *ptr;
 	u32 index;
 
-	if (raw_res_spin_lock_irqsave(&qs->lock, flags))
+	if (raw_res_spin_lock_irqsave(&qs->lock, flags)) {
+		ctx.deadlock = 1;
+		arch_bpf_stack_walk(bpf_term_stack_walker, &ctx);
 		return -EBUSY;
+	}
 
 	if (queue_stack_map_is_empty(qs)) {
 		memset(value, 0, qs->map.value_size);
@@ -183,6 +192,7 @@ static long queue_stack_map_push_elem(struct bpf_map *map, void *value,
 				      u64 flags)
 {
 	struct bpf_queue_stack *qs = bpf_queue_stack(map);
+	struct bpf_term_ctx ctx;
 	unsigned long irq_flags;
 	int err = 0;
 	void *dst;
@@ -196,8 +206,11 @@ static long queue_stack_map_push_elem(struct bpf_map *map, void *value,
 	if (flags & BPF_NOEXIST || flags > BPF_EXIST)
 		return -EINVAL;
 
-	if (raw_res_spin_lock_irqsave(&qs->lock, irq_flags))
+	if (raw_res_spin_lock_irqsave(&qs->lock, irq_flags)) {
+		ctx.deadlock = 1;
+		arch_bpf_stack_walk(bpf_term_stack_walker, &ctx);
 		return -EBUSY;
+	}
 
 	if (queue_stack_map_is_full(qs)) {
 		if (!replace) {

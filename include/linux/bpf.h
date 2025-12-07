@@ -1591,6 +1591,11 @@ struct call_aux_states {
 	u8 is_helper_kfunc;
 	u8 is_bpf_loop;
 	u8 is_bpf_loop_cb_inline;
+	u8 is_helper_kfunc_ret_non_zero;
+};
+
+struct bpf_term_ctx {
+	bool deadlock;
 };
 
 struct bpf_term_patch_call_sites {

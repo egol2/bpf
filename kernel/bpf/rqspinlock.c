@@ -17,6 +17,8 @@
 #include <linux/bug.h>
 #include <linux/bpf.h>
 #include <linux/err.h>
+#include <linux/bpf.h>
+#include <linux/filter.h>
 #include <linux/cpumask.h>
 #include <linux/percpu.h>
 #include <linux/hardirq.h>
@@ -690,6 +692,7 @@ static void bpf_prog_report_rqspinlock_violation(const char *str, void *lock, bo
 __bpf_kfunc int bpf_res_spin_lock(struct bpf_res_spin_lock *lock)
 {
 	int ret;
+	struct bpf_term_ctx ctx;
 
 	BUILD_BUG_ON(sizeof(rqspinlock_t) != sizeof(struct bpf_res_spin_lock));
 	BUILD_BUG_ON(__alignof__(rqspinlock_t) != __alignof__(struct bpf_res_spin_lock));
@@ -697,6 +700,9 @@ __bpf_kfunc int bpf_res_spin_lock(struct bpf_res_spin_lock *lock)
 	preempt_disable();
 	ret = res_spin_lock((rqspinlock_t *)lock);
 	if (unlikely(ret)) {
+		pr_info("deadlock detected\n");
+		ctx.deadlock = 1;
+		arch_bpf_stack_walk(bpf_term_stack_walker, &ctx);
 		bpf_prog_report_rqspinlock_violation(REPORT_STR(ret), lock, false);
 		preempt_enable();
 		return ret;
@@ -715,11 +721,15 @@ __bpf_kfunc int bpf_res_spin_lock_irqsave(struct bpf_res_spin_lock *lock, unsign
 	u64 *ptr = (u64 *)flags__irq_flag;
 	unsigned long flags;
 	int ret;
+	struct bpf_term_ctx ctx;
 
 	preempt_disable();
 	local_irq_save(flags);
 	ret = res_spin_lock((rqspinlock_t *)lock);
 	if (unlikely(ret)) {
+		pr_info("deadlock detected\n");
+		ctx.deadlock = 1;
+		arch_bpf_stack_walk(bpf_term_stack_walker, &ctx);
 		bpf_prog_report_rqspinlock_violation(REPORT_STR(ret), lock, true);
 		local_irq_restore(flags);
 		preempt_enable();

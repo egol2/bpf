@@ -3866,14 +3866,16 @@ void in_place_patch_bpf_prog(struct bpf_prog *prog)
 	}
 	call_states = prog->term_states->patch_call_sites->call_states;
 	for (int i = 0; i < prog->term_states->patch_call_sites->call_sites_cnt; i++) {
-		
-		new_target = (unsigned long) bpf_termination_null_func;
 		if (call_states[i].is_bpf_loop_cb_inline) {
 			new_target = (unsigned long) bpf_loop_term_callback;	
+		} else if (call_states[i].is_helper_kfunc_ret_non_zero) {
+			new_target = (unsigned long) bpf_dummy_ret_non_zero;	
+		} else {
+			new_target = (unsigned long) bpf_termination_null_func;
 		}
 		char new_insn[5];
 
-		addr = (unsigned char *)prog->bpf_func + call_states->jit_call_idx;
+		addr = (unsigned char *)prog->bpf_func + call_states[i].jit_call_idx;
 
 		unsigned long new_rel = (unsigned long)(new_target - (unsigned long)(addr + 5));
 		new_insn[0] = 0xE8;
@@ -3945,43 +3947,49 @@ void bpf_prog_termination_deferred(struct work_struct *work)
 
 static struct workqueue_struct *bpf_termination_wq;
 
-void bpf_softlockup(u32 dur_s)
+bool bpf_term_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 {
-	unsigned long addr;
-	struct unwind_state state;
 	struct bpf_prog *prog;
 
-	for (unwind_start(&state, current, NULL, NULL); !unwind_done(&state);
-	     unwind_next_frame(&state)) {
-		addr = unwind_get_return_address(&state);
-		if (!addr)
-			break;
+	if (!is_bpf_text_address(ip))
+		return true;
 
-		if (!is_bpf_text_address(addr))
-			continue;
+	rcu_read_lock();
+	prog = bpf_prog_ksym_find(ip);
+	rcu_read_unlock();
 
-		rcu_read_lock();
-		prog = bpf_prog_ksym_find(addr);
-		rcu_read_unlock();
-		if (bpf_is_subprog(prog))
-			continue;
-
-		if (atomic_cmpxchg(&prog->term_states->bpf_die_in_progress, 0, 1))
-			break;
+	if (bpf_is_subprog(prog))
+		return true;
 	
+	if (atomic_cmpxchg(&prog->term_states->bpf_die_in_progress, 0, 1))
+		return false;
+	
+	if (!cookie) {
+		bpf_die(prog);
+	} else {
 		bpf_termination_wq = alloc_workqueue("bpf_termination_wq", WQ_UNBOUND, 1);
 		if (!bpf_termination_wq)
 			pr_err("Failed to alloc workqueue for bpf termination.\n");
 
 		queue_work(bpf_termination_wq, &prog->term_states->work);
-
-		/* Currently nested programs are not terminated together.
-		 * Removing this break will result in BPF trampolines being
-		 * identified as is_bpf_text_address resulting in NULL ptr
-		 * deref in next step.
-		 */
-		break;
 	}
+
+	/* Currently nested programs are not terminated together.
+	 * Removing this break will result in BPF trampolines being
+	 * identified as is_bpf_text_address resulting in NULL ptr
+	 * deref in next step.
+	 */
+	return false;
+}
+
+struct bpf_term_dummy {
+	u32 dummy;
+};
+
+void bpf_softlockup(u32 dur_s)
+{
+	struct bpf_term_dummy ctx = {};
+	arch_bpf_stack_walk(bpf_term_stack_walker, &ctx);
 }
 
 void bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,

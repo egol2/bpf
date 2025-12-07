@@ -106,6 +106,10 @@ int bpf_loop_term_callback(u64 reg_loop_cnt, u64 *reg_loop_ctx)
 	return 1;
 }
 
+int bpf_dummy_ret_non_zero(void)
+{
+	return 1;
+}
 
 void __weak in_place_patch_bpf_prog(struct bpf_prog *prog)
 {
