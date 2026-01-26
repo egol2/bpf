@@ -3742,8 +3742,22 @@ out_image:
 			struct bpf_term_patch_call_sites *patch_call_sites = prog->term_states->patch_call_sites;
 			for (int i = 0; i < patch_call_sites->call_sites_cnt; i++) {
 				struct call_aux_states *call_states = patch_call_sites->call_states + i;
-				call_states->jit_call_idx = addrs[call_states->call_bpf_insn_idx];
+				if (prog->aux->priv_stack_ptr) {
+					call_states->jit_call_idx = addrs[call_states->call_bpf_insn_idx] + 2;
+				} else {
+					call_states->jit_call_idx = addrs[call_states->call_bpf_insn_idx];
+				}
 			}
+			//pr_info("bpf_int_jit_compile: call_sites_cnt %d\n", patch_call_sites->call_sites_cnt);
+			//for (int i = 0; i < patch_call_sites->call_sites_cnt; i++) {
+			//	struct call_aux_states *call_states = patch_call_sites->call_states + i;
+			//	pr_info("bpf_int_jit_compile: call_states->call_bpf_insn_idx %d\n", call_states->call_bpf_insn_idx);
+			//	pr_info("bpf_int_jit_compile: call_states->jit_call_idx 0x%x\n", call_states->jit_call_idx);
+			//}
+			//pr_info("bpf_int_jit_compile: bpf prog->len %d\n", prog->len);
+			//for (int i = 0; i <= prog->len; i++) {
+			//	pr_info("bpf_int_jit_compile: jit addrs[%d] 0x%x\n", i, addrs[i]);
+			//}
 		}
 		
 		if (image)
@@ -3903,23 +3917,37 @@ void in_place_patch_bpf_prog(struct bpf_prog *prog)
 void bpf_die(struct bpf_prog *prog)
 {
 	u8 ret_jmp_size = 1;
+	unsigned long ret_addr;
 	if (cpu_wants_rethunk()) {
 		ret_jmp_size = 5;
+		ret_addr = (unsigned long)&its_return_thunk;
+	} else {
+		ret_addr = 0;
 	}
 
-	/*
-	 * Replacing 5 byte nop in prologue with jmp instruction to ret
-	 */
-	unsigned long jmp_offset = prog->jited_len - (4 /* First endbr is 4 bytes */ 
-					+ 5 /* noop is 5 bytes */ 
-					+ ret_jmp_size /* 5 bytes of jmp return_thunk or 1 byte ret*/);
 
+	/*
+	 * Replacing 5 byte nop with jmp/ ret
+	 */
 	char new_insn[5];
-	new_insn[0] = 0xE9;
-	new_insn[1] = (jmp_offset >> 0) & 0xFF;
-	new_insn[2] = (jmp_offset >> 8) & 0xFF;
-	new_insn[3] = (jmp_offset >> 16) & 0xFF;
-	new_insn[4] = (jmp_offset >> 24) & 0xFF;
+	if (cpu_wants_rethunk()) {
+		unsigned long jmp_offset = ret_addr - (
+					(unsigned long)(prog->bpf_func + 4) /* First endbr is 4 bytes */ 
+					+ 5 /*nop is 5 bytes*/
+					);					
+					
+		new_insn[0] = 0xE9;
+		new_insn[1] = (jmp_offset >> 0) & 0xFF;
+		new_insn[2] = (jmp_offset >> 8) & 0xFF;
+		new_insn[3] = (jmp_offset >> 16) & 0xFF;
+		new_insn[4] = (jmp_offset >> 24) & 0xFF;
+	} else {
+		new_insn[0] = 0xC3;
+		new_insn[1] = 0x90;
+		new_insn[2] = 0x90;
+		new_insn[3] = 0x90;
+		new_insn[4] = 0x90;
+	}
 
 	smp_text_poke_batch_add(prog->bpf_func + 4, new_insn, 5, NULL);
 

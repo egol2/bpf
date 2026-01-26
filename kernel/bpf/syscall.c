@@ -2764,6 +2764,26 @@ static bool is_perfmon_prog_type(enum bpf_prog_type prog_type)
 /* last field in 'union bpf_attr' used by this command */
 #define BPF_PROG_LOAD_LAST_FIELD fd_array_cnt
 
+static void debug_bpf_prog_jit(struct bpf_prog *prog)
+{
+	if (strncmp(prog->aux->name, "bpf_prog", 8))
+		return;
+
+	pr_info("debug_bpf_prog_jit: prog->jited_len %d\n", prog->jited_len);
+	print_hex_dump(KERN_INFO, "JIT code: prog - ", DUMP_PREFIX_OFFSET,
+			16, 1, prog->bpf_func, prog->jited_len, false);
+	
+
+	for (int subprog = 0; subprog < prog->aux->func_cnt; subprog++) {
+		pr_info("debug_bpf_prog_jit: subprog[%d] - jited_len %d\n", 
+					subprog, prog->aux->func[subprog]->jited_len);
+		print_hex_dump(KERN_INFO, "JIT code: prog - ", DUMP_PREFIX_OFFSET,
+			16, 1, prog->aux->func[subprog]->bpf_func, prog->aux->func[subprog]->jited_len, false);
+	}
+
+	return;
+}
+
 static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 {
 	enum bpf_prog_type type = attr->prog_type;
@@ -2983,6 +3003,8 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	prog = bpf_prog_select_runtime(prog, &err);
 	if (err < 0)
 		goto free_used_maps;
+
+	//debug_bpf_prog_jit(prog);
 
 	err = bpf_prog_alloc_id(prog);
 	if (err)
