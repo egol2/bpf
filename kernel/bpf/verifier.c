@@ -22318,6 +22318,26 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	prog->aux->bpf_exception_cb = (void *)func[env->exception_callback_subprog]->bpf_func;
 	prog->aux->exception_boundary = func[0]->aux->exception_boundary;
 	prog->aux->fdtab = func[0]->aux->fdtab;
+	/* Print total memory overhead for storing unwind information */
+	{
+		size_t total_unwind_mem = 0;
+
+		for (i = 0; i < env->subprog_cnt; i++) {
+			struct bpf_exception_frame_desc_tab *fdtab = func[i]->aux->fdtab;
+
+			if (!fdtab)
+				continue;
+			total_unwind_mem += sizeof(*fdtab);
+			total_unwind_mem += fdtab->cnt * sizeof(*fdtab->desc);
+			for (int k = 0; k < fdtab->cnt; k++) {
+				total_unwind_mem += offsetof(struct bpf_exception_frame_desc,
+							    stack[fdtab->desc[k]->stack_cnt]);
+			}
+		}
+		if (total_unwind_mem)
+			printk(KERN_INFO "BPF prog %s: total unwind info memory overhead: %zu bytes (%d subprogs)\n",
+			       prog->aux->name, total_unwind_mem, env->subprog_cnt);
+	}
 	bpf_prog_jit_attempt_done(prog);
 	return 0;
 out_free:
