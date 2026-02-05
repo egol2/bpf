@@ -22121,6 +22121,8 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 	struct call_aux_states *call_states;
 
 	call_states = vzalloc(sizeof(*call_states) * prog->len);
+	printk("vzalloc size: %zu bytes\n", sizeof(*call_states) * prog->len);
+	
 	if (!call_states)
 		return -ENOMEM;
 
