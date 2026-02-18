@@ -3982,6 +3982,7 @@ static int bpf_frame_spilled_caller_reg_off(struct bpf_prog *prog, int regno)
 void arch_bpf_cleanup_frame_resource(struct bpf_prog *prog, struct bpf_throw_ctx *ctx, u64 ip, u64 sp, u64 bp) {
 	struct bpf_exception_frame_desc_tab *fdtab = prog->aux->fdtab;
 	struct bpf_exception_frame_desc *fd = NULL;
+	u64 frame_fp = bp;
 	u64 ip_off = ip - (u64)prog->bpf_func;
 
 	/* Hidden subprogs and subprogs without fdtab do not need cleanup. */
@@ -3998,8 +3999,17 @@ void arch_bpf_cleanup_frame_resource(struct bpf_prog *prog, struct bpf_throw_ctx
 	if (WARN_ON_ONCE(!fd))
 		return;
 
+	/* With private stack enabled, BPF stack slots are relative to r9, not rbp. */
+	if (prog->aux->priv_stack_ptr) {
+		char *frame_ptr;
+
+		frame_ptr = this_cpu_ptr(prog->aux->priv_stack_ptr);
+		frame_ptr += PRIV_STACK_GUARD_SZ + round_up(prog->aux->stack_depth, 8);
+		frame_fp = (u64)frame_ptr;
+	}
+
 	for (int i = 0; i < fd->stack_cnt; i++) {
-		void *ptr = (void *)((s64)bp + fd->stack[i].off);
+		void *ptr = (void *)((s64)frame_fp + fd->stack[i].off);
 
 		bpf_cleanup_resource(fd->stack + i, ptr);
 	}
