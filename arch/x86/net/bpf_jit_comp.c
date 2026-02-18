@@ -3979,11 +3979,50 @@ static int bpf_frame_spilled_caller_reg_off(struct bpf_prog *prog, int regno)
 	return 0;
 }
 
+static u64 bpf_exception_frame_sp(const struct bpf_prog *prog, u64 bp)
+{
+	s64 sp = bp;
+
+	/* Private-stack mode does not subtract stack depth from rsp. */
+	if (!prog->aux->priv_stack_ptr)
+		sp -= round_up(prog->aux->stack_depth, 8);
+
+	if (prog->aux->tail_call_reachable)
+		sp -= 2 * sizeof(u64);
+
+	/*
+	 * Exception boundary and bpf_throw_tramp prologues force-save all BPF
+	 * callee-saved regs. Main exception boundary also saves r12.
+	 */
+	if (prog->aux->exception_boundary || prog->aux->bpf_throw_tramp) {
+		if (prog->aux->exception_boundary)
+			sp -= sizeof(u64);
+		sp -= 4 * sizeof(u64);
+		return sp;
+	}
+
+	if (bpf_arena_get_kern_vm_start(prog->aux->arena))
+		sp -= sizeof(u64);
+
+	for (int i = 0; i < ARRAY_SIZE(prog->aux->callee_regs_used); i++) {
+		if (prog->aux->callee_regs_used[i])
+			sp -= sizeof(u64);
+	}
+
+	return sp;
+}
+
 void arch_bpf_cleanup_frame_resource(struct bpf_prog *prog, struct bpf_throw_ctx *ctx, u64 ip, u64 sp, u64 bp) {
 	struct bpf_exception_frame_desc_tab *fdtab = prog->aux->fdtab;
 	struct bpf_exception_frame_desc *fd = NULL;
+	u64 frame_sp = bpf_exception_frame_sp(prog, bp);
 	u64 frame_fp = bp;
 	u64 ip_off = ip - (u64)prog->bpf_func;
+
+	(void)sp;
+
+	/* Use reconstructed frame stack pointer for callback longjmp restore. */
+	ctx->sp = frame_sp;
 
 	/* Hidden subprogs and subprogs without fdtab do not need cleanup. */
 	if (bpf_is_hidden_subprog(prog) || !fdtab)
@@ -4019,7 +4058,7 @@ void arch_bpf_cleanup_frame_resource(struct bpf_prog *prog, struct bpf_throw_ctx
 
 		if (!fd->regs[i].regno || fd->regs[i].type == NOT_INIT || fd->regs[i].type == SCALAR_VALUE)
 			continue;
-		/* Our sp will be bp of new frame before caller regs are spilled, so offset is relative to our sp. */
+		/* Spill offsets are relative to frame_sp before caller-reg recovery. */
 		WARN_ON_ONCE(!ctx->saved_reg[i]);
 		ptr = (void *)&ctx->saved_reg[i];
 		bpf_cleanup_resource(fd->regs + i, ptr);
@@ -4046,7 +4085,7 @@ end:
 	if (bpf_is_subprog(prog)) {
 		for (int i = 0; i < ARRAY_SIZE(prog->aux->callee_regs_used); i++) {
 			if (prog->aux->callee_regs_used[i])
-				ctx->saved_reg[i] = *(u64 *)((s64)sp + bpf_frame_spilled_caller_reg_off(prog, BPF_REG_6 + i));
+				ctx->saved_reg[i] = *(u64 *)((s64)frame_sp + bpf_frame_spilled_caller_reg_off(prog, BPF_REG_6 + i));
 		}
 	}
 }
