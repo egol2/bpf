@@ -768,9 +768,10 @@ static void emit_bpf_tail_call_indirect(struct bpf_prog *bpf_prog,
 	/* Inc tail_call_cnt if the slot is populated. */
 	EMIT4(0x48, 0x83, 0x00, 0x01);            /* add qword ptr [rax], 1 */
 
-	if (bpf_prog->aux->exception_boundary || bpf_prog->aux->bpf_throw_tramp) {
+	if (bpf_prog->aux->exception_boundary || bpf_prog->aux->bpf_throw_tramp ||
+	    bpf_prog->aux->exception_cb) {
 		pop_callee_regs(&prog, all_callee_regs_used);
-		if (bpf_prog->aux->exception_boundary)
+		if (bpf_prog->aux->exception_boundary || bpf_prog->aux->exception_cb)
 			pop_r12(&prog);
 	} else {
 		pop_callee_regs(&prog, callee_regs_used);
@@ -836,9 +837,10 @@ static void emit_bpf_tail_call_direct(struct bpf_prog *bpf_prog,
 	/* Inc tail_call_cnt if the slot is populated. */
 	EMIT4(0x48, 0x83, 0x00, 0x01);                /* add qword ptr [rax], 1 */
 
-	if (bpf_prog->aux->exception_boundary || bpf_prog->aux->bpf_throw_tramp) {
+	if (bpf_prog->aux->exception_boundary || bpf_prog->aux->bpf_throw_tramp ||
+	    bpf_prog->aux->exception_cb) {
 		pop_callee_regs(&prog, all_callee_regs_used);
-		if (bpf_prog->aux->exception_boundary)
+		if (bpf_prog->aux->exception_boundary || bpf_prog->aux->exception_cb)
 			pop_r12(&prog);
 	} else {
 		pop_callee_regs(&prog, callee_regs_used);
@@ -1666,8 +1668,9 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 	/* Exception callback will clobber callee regs for its own use, and
 	 * restore the original callee regs from main prog's stack frame.
 	 */
-	if (bpf_prog->aux->exception_boundary || bpf_prog->aux->bpf_throw_tramp) {
-		if (bpf_prog->aux->exception_boundary)
+	if (bpf_prog->aux->exception_boundary || bpf_prog->aux->bpf_throw_tramp ||
+	    bpf_prog->aux->exception_cb) {
+		if (bpf_prog->aux->exception_boundary || bpf_prog->aux->exception_cb)
 			push_r12(&prog);
 		push_callee_regs(&prog, all_callee_regs_used);
 	} else {
@@ -2706,9 +2709,10 @@ emit_jmp:
 				if (emit_spectre_bhb_barrier(&prog, ip, bpf_prog))
 					return -EINVAL;
 			}
-			if (bpf_prog->aux->exception_boundary || bpf_prog->aux->bpf_throw_tramp) {
+			if (bpf_prog->aux->exception_boundary || bpf_prog->aux->bpf_throw_tramp ||
+			    bpf_prog->aux->exception_cb) {
 				pop_callee_regs(&prog, all_callee_regs_used);
-				if (bpf_prog->aux->exception_boundary)
+				if (bpf_prog->aux->exception_boundary || bpf_prog->aux->exception_cb)
 					pop_r12(&prog);
 			} else {
 				pop_callee_regs(&prog, callee_regs_used);
