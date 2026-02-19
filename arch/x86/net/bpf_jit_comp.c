@@ -4018,6 +4018,7 @@ void arch_bpf_cleanup_frame_resource(struct bpf_prog *prog, struct bpf_throw_ctx
 	u64 cleanup_sp = bpf_exception_frame_sp(prog, bp);
 	u64 frame_fp = bp;
 	u64 ip_off = ip - (u64)prog->bpf_func;
+	(void)sp;
 
 	/*
 	 * Keep callback landing state tied to the true exception boundary frame.
@@ -4026,7 +4027,7 @@ void arch_bpf_cleanup_frame_resource(struct bpf_prog *prog, struct bpf_throw_ctx
 	if (prog->aux->exception_boundary && !ctx->landing_found) {
 		ctx->landing_found = true;
 		ctx->landing_aux = prog->aux;
-		ctx->landing_sp = sp;
+		ctx->landing_sp = cleanup_sp;
 		ctx->landing_bp = bp;
 	}
 
