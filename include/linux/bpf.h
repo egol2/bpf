@@ -3803,6 +3803,10 @@ struct bpf_throw_ctx {
 	struct bpf_prog_aux *aux;
 	u64 sp;
 	u64 bp;
+	bool landing_found;
+	struct bpf_prog_aux *landing_aux;
+	u64 landing_sp;
+	u64 landing_bp;
 	union {
 		struct {
 			u64 saved_r6;

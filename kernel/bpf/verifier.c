@@ -22619,6 +22619,105 @@ static int add_hidden_subprog(struct bpf_verifier_env *env, struct bpf_insn *pat
 	return 0;
 }
 
+static int validate_throw_fixups(struct bpf_verifier_env *env)
+{
+	struct bpf_prog *prog = env->prog;
+	int i;
+
+	if (!env->seen_exception)
+		return 0;
+
+	if (env->exception_callback_subprog <= 0 ||
+	    env->exception_callback_subprog >= env->subprog_cnt) {
+		verbose(env, "verifier internal error: invalid exception callback subprog %d\n",
+			env->exception_callback_subprog);
+		return -EFAULT;
+	}
+	if (env->bpf_throw_tramp_subprog <= 0 ||
+	    env->bpf_throw_tramp_subprog >= env->subprog_cnt) {
+		verbose(env, "verifier internal error: invalid bpf_throw_tramp subprog %d\n",
+			env->bpf_throw_tramp_subprog);
+		return -EFAULT;
+	}
+	if (env->bpf_throw_tramp_subprog == env->exception_callback_subprog) {
+		verbose(env,
+			"verifier internal error: bpf_throw_tramp subprog collides with exception callback subprog\n");
+		return -EFAULT;
+	}
+	if (!subprog_info(env, env->exception_callback_subprog)->is_exception_cb) {
+		verbose(env,
+			"verifier internal error: exception callback subprog is not marked as callback\n");
+		return -EFAULT;
+	}
+
+	for (i = 0; i < env->subprog_cnt; i++) {
+		struct bpf_subprog_info *si = subprog_info(env, i);
+		struct bpf_exception_frame_desc_tab *fdtab = si->fdtab;
+		int start = si->start;
+		int end = subprog_info(env, i + 1)->start;
+		int j;
+
+		if (si->is_throw_reachable && (si->is_cb || si->is_async_cb)) {
+			verbose(env,
+				"verifier internal error: throw-reachable callback subprog %d detected\n",
+				i);
+			return -EFAULT;
+		}
+		if (!fdtab)
+			continue;
+
+		if (fdtab->final) {
+			verbose(env,
+				"verifier internal error: subprog %d has finalized frame descriptors before JIT\n",
+				i);
+			return -EFAULT;
+		}
+		for (j = 0; j < fdtab->cnt; j++) {
+			struct bpf_exception_frame_desc *desc = fdtab->desc[j];
+
+			if (!desc) {
+				verbose(env,
+					"verifier internal error: NULL frame descriptor in subprog %d\n",
+					i);
+				return -EFAULT;
+			}
+			if (desc->pc < start || desc->pc >= end) {
+				verbose(env,
+					"verifier internal error: frame descriptor pc=%llu out of range [%d, %d) for subprog %d\n",
+					(unsigned long long)desc->pc, start, end, i);
+				return -EFAULT;
+			}
+		}
+	}
+
+	for (i = 0; i < prog->len; i++) {
+		struct bpf_subprog_info *containing;
+		int subprogno;
+
+		if (!bpf_pseudo_kfunc_call(&prog->insnsi[i]) || prog->insnsi[i].off != 0)
+			continue;
+		if (!is_bpf_throw_kfunc(&prog->insnsi[i]))
+			continue;
+
+		containing = bpf_find_containing_subprog(env, i);
+		if (!containing) {
+			verbose(env,
+				"verifier internal error: throw call at insn %d is outside known subprograms\n",
+				i);
+			return -EFAULT;
+		}
+		subprogno = containing - env->subprog_info;
+		if (subprogno != env->bpf_throw_tramp_subprog) {
+			verbose(env,
+				"verifier internal error: throw call at insn %d escaped trampoline rewrite (subprog %d)\n",
+				i, subprogno);
+			return -EFAULT;
+		}
+	}
+
+	return 0;
+}
+
 /* Do various post-verification rewrites in a single program pass.
  * These rewrites simplify JIT and interpreter implementations.
  */
@@ -23568,6 +23667,10 @@ next_insn:
 		 */
 		WARN_ON(adjust_jmp_off(env->prog, subprog_start, delta));
 	}
+
+	ret = validate_throw_fixups(env);
+	if (ret < 0)
+		return ret;
 
 	/* Since poke tab is now finalized, publish aux to tracker. */
 	for (i = 0; i < prog->aux->size_poke_tab; i++) {

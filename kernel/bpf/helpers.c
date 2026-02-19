@@ -3147,19 +3147,32 @@ __bpf_kfunc void bpf_throw(u64 cookie)
 	stack_walk_end = ktime_get_ns();
 	
 	stats->stack_walk_time_ns += (stack_walk_end - stack_walk_start);
-	
-	WARN_ON_ONCE(!ctx.aux);
-	if (ctx.aux)
-		WARN_ON_ONCE(!ctx.aux->exception_boundary);
-	WARN_ON_ONCE(!ctx.bp);
+
+	if (!ctx.landing_found) {
+		ctx.landing_aux = ctx.aux;
+		ctx.landing_sp = ctx.sp;
+		ctx.landing_bp = ctx.bp;
+	}
+	if (!ctx.landing_aux)
+		ctx.landing_aux = ctx.aux;
+	if (!ctx.landing_sp)
+		ctx.landing_sp = ctx.sp;
+	if (!ctx.landing_bp)
+		ctx.landing_bp = ctx.bp;
+
+	WARN_ON_ONCE(!ctx.landing_found);
+	WARN_ON_ONCE(!ctx.landing_aux);
+	if (ctx.landing_aux)
+		WARN_ON_ONCE(!ctx.landing_aux->exception_boundary);
+	WARN_ON_ONCE(!ctx.landing_bp);
 	WARN_ON_ONCE(!ctx.cnt);
-	
+
 	/* Prevent KASAN false positives for CONFIG_KASAN_STACK by unpoisoning
-	 * deeper stack depths than ctx.sp as we do not return from bpf_throw,
+	 * deeper stack depths than the callback landing SP as we do not return from bpf_throw,
 	 * which skips compiler generated instrumentation to do the same.
 	 */
-	kasan_unpoison_task_stack_below((void *)(long)ctx.sp);
-	
+	kasan_unpoison_task_stack_below((void *)(long)ctx.landing_sp);
+
 	/* Record time before callback (callback doesn't return) */
 	stats->last_call_time_ns = ktime_get_ns() - start_time;
 	stats->total_time_ns += stats->last_call_time_ns;
@@ -3168,7 +3181,7 @@ __bpf_kfunc void bpf_throw(u64 cookie)
 	// trace_printk("bpf_throw: %llu ns (stack_walk: %llu ns)\n", 
 	//              stats->last_call_time_ns, stack_walk_end - stack_walk_start);
 	
-	ctx.aux->bpf_exception_cb(cookie, ctx.sp, ctx.bp, 0, 0);
+	ctx.landing_aux->bpf_exception_cb(cookie, ctx.landing_sp, ctx.landing_bp, 0, 0);
 	WARN(1, "A call to BPF exception callback should never return\n");
 }
 

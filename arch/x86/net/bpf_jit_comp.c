@@ -4015,14 +4015,20 @@ static u64 bpf_exception_frame_sp(const struct bpf_prog *prog, u64 bp)
 void arch_bpf_cleanup_frame_resource(struct bpf_prog *prog, struct bpf_throw_ctx *ctx, u64 ip, u64 sp, u64 bp) {
 	struct bpf_exception_frame_desc_tab *fdtab = prog->aux->fdtab;
 	struct bpf_exception_frame_desc *fd = NULL;
-	u64 frame_sp = bpf_exception_frame_sp(prog, bp);
+	u64 cleanup_sp = bpf_exception_frame_sp(prog, bp);
 	u64 frame_fp = bp;
 	u64 ip_off = ip - (u64)prog->bpf_func;
 
-	(void)sp;
-
-	/* Use reconstructed frame stack pointer for callback longjmp restore. */
-	ctx->sp = frame_sp;
+	/*
+	 * Keep callback landing state tied to the true exception boundary frame.
+	 * Resource cleanup can still use reconstructed frame pointers.
+	 */
+	if (prog->aux->exception_boundary && !ctx->landing_found) {
+		ctx->landing_found = true;
+		ctx->landing_aux = prog->aux;
+		ctx->landing_sp = sp;
+		ctx->landing_bp = bp;
+	}
 
 	/* Hidden subprogs and subprogs without fdtab do not need cleanup. */
 	if (bpf_is_hidden_subprog(prog) || !fdtab)
@@ -4058,7 +4064,7 @@ void arch_bpf_cleanup_frame_resource(struct bpf_prog *prog, struct bpf_throw_ctx
 
 		if (!fd->regs[i].regno || fd->regs[i].type == NOT_INIT || fd->regs[i].type == SCALAR_VALUE)
 			continue;
-		/* Spill offsets are relative to frame_sp before caller-reg recovery. */
+		/* Spill offsets are relative to cleanup_sp before caller-reg recovery. */
 		WARN_ON_ONCE(!ctx->saved_reg[i]);
 		ptr = (void *)&ctx->saved_reg[i];
 		bpf_cleanup_resource(fd->regs + i, ptr);
@@ -4085,7 +4091,7 @@ end:
 	if (bpf_is_subprog(prog)) {
 		for (int i = 0; i < ARRAY_SIZE(prog->aux->callee_regs_used); i++) {
 			if (prog->aux->callee_regs_used[i])
-				ctx->saved_reg[i] = *(u64 *)((s64)frame_sp + bpf_frame_spilled_caller_reg_off(prog, BPF_REG_6 + i));
+				ctx->saved_reg[i] = *(u64 *)((s64)cleanup_sp + bpf_frame_spilled_caller_reg_off(prog, BPF_REG_6 + i));
 		}
 	}
 }
