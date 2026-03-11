@@ -3983,6 +3983,21 @@ static int bpf_frame_spilled_caller_reg_off(struct bpf_prog *prog, int regno)
 	return 0;
 }
 
+/*
+ * The main program's kallsyms entry belongs to the aggregate prog, while the
+ * JITed execution state for the main frame lives on func[0]. Use func[0] for
+ * frame reconstruction so private-stack and other JIT-only metadata matches
+ * the actual runtime frame layout.
+ */
+static struct bpf_prog *bpf_throw_runtime_frame_prog(struct bpf_prog *prog)
+{
+	if (!bpf_is_subprog(prog) && prog->aux->func_cnt && prog->aux->func &&
+	    prog->aux->func[0])
+		return prog->aux->func[0];
+
+	return prog;
+}
+
 static u64 bpf_exception_frame_sp(const struct bpf_prog *prog, u64 bp)
 {
 	s64 sp = bp;
@@ -4017,26 +4032,27 @@ static u64 bpf_exception_frame_sp(const struct bpf_prog *prog, u64 bp)
 }
 
 void arch_bpf_cleanup_frame_resource(struct bpf_prog *prog, struct bpf_throw_ctx *ctx, u64 ip, u64 sp, u64 bp) {
-	struct bpf_exception_frame_desc_tab *fdtab = prog->aux->fdtab;
+	struct bpf_prog *frame_prog = bpf_throw_runtime_frame_prog(prog);
+	struct bpf_exception_frame_desc_tab *fdtab = frame_prog->aux->fdtab;
 	struct bpf_exception_frame_desc *fd = NULL;
-	u64 cleanup_sp = bpf_exception_frame_sp(prog, bp);
+	u64 cleanup_sp = bpf_exception_frame_sp(frame_prog, bp);
 	u64 frame_fp = bp;
-	u64 ip_off = ip - (u64)prog->bpf_func;
+	u64 ip_off = ip - (u64)frame_prog->bpf_func;
 	(void)sp;
 
 	/*
 	 * Keep callback landing state tied to the true exception boundary frame.
 	 * Resource cleanup can still use reconstructed frame pointers.
 	 */
-	if (prog->aux->exception_boundary && !ctx->landing_found) {
+	if (frame_prog->aux->exception_boundary && !ctx->landing_found) {
 		ctx->landing_found = true;
-		ctx->landing_aux = prog->aux;
+		ctx->landing_aux = frame_prog->aux->main_prog_aux;
 		ctx->landing_sp = cleanup_sp;
 		ctx->landing_bp = bp;
 	}
 
 	/* Hidden subprogs and subprogs without fdtab do not need cleanup. */
-	if (bpf_is_hidden_subprog(prog) || !fdtab)
+	if (bpf_is_hidden_subprog(frame_prog) || !fdtab)
 		goto end;
 
 	for (int i = 0; i < fdtab->cnt; i++) {
@@ -4050,11 +4066,11 @@ void arch_bpf_cleanup_frame_resource(struct bpf_prog *prog, struct bpf_throw_ctx
 		return;
 
 	/* With private stack enabled, BPF stack slots are relative to r9, not rbp. */
-	if (prog->aux->priv_stack_ptr) {
+	if (frame_prog->aux->priv_stack_ptr) {
 		char *frame_ptr;
 
-		frame_ptr = this_cpu_ptr(prog->aux->priv_stack_ptr);
-		frame_ptr += PRIV_STACK_GUARD_SZ + round_up(prog->aux->stack_depth, 8);
+		frame_ptr = this_cpu_ptr(frame_prog->aux->priv_stack_ptr);
+		frame_ptr += PRIV_STACK_GUARD_SZ + round_up(frame_prog->aux->stack_depth, 8);
 		frame_fp = (u64)frame_ptr;
 	}
 
@@ -4093,10 +4109,10 @@ end:
 	 * Thus, for main, we have the correct saved_regs values even though they
 	 * were spilled in multiple callee stack frames down the call chain.
 	 */
-	if (bpf_is_subprog(prog)) {
-		for (int i = 0; i < ARRAY_SIZE(prog->aux->callee_regs_used); i++) {
-			if (prog->aux->callee_regs_used[i])
-				ctx->saved_reg[i] = *(u64 *)((s64)cleanup_sp + bpf_frame_spilled_caller_reg_off(prog, BPF_REG_6 + i));
+	if (bpf_is_subprog(frame_prog)) {
+		for (int i = 0; i < ARRAY_SIZE(frame_prog->aux->callee_regs_used); i++) {
+			if (frame_prog->aux->callee_regs_used[i])
+				ctx->saved_reg[i] = *(u64 *)((s64)cleanup_sp + bpf_frame_spilled_caller_reg_off(frame_prog, BPF_REG_6 + i));
 		}
 	}
 }
