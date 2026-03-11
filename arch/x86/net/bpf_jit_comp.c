@@ -3918,6 +3918,11 @@ void bpf_die(struct bpf_prog *prog)
 {
 	u8 ret_jmp_size = 1;
 	unsigned long ret_addr;
+	unsigned long patch_ip = (unsigned long)prog->bpf_func;
+
+	if (is_endbr((u32 *)patch_ip))
+		patch_ip += ENDBR_INSN_SIZE;
+
 	if (cpu_wants_rethunk()) {
 		ret_jmp_size = 5;
 		ret_addr = (unsigned long)&its_return_thunk;
@@ -3931,16 +3936,9 @@ void bpf_die(struct bpf_prog *prog)
 	 */
 	char new_insn[5];
 	if (cpu_wants_rethunk()) {
-		unsigned long jmp_offset = ret_addr - (
-					(unsigned long)(prog->bpf_func + 4) /* First endbr is 4 bytes */ 
-					+ 5 /*nop is 5 bytes*/
-					);					
-					
-		new_insn[0] = 0xE9;
-		new_insn[1] = (jmp_offset >> 0) & 0xFF;
-		new_insn[2] = (jmp_offset >> 8) & 0xFF;
-		new_insn[3] = (jmp_offset >> 16) & 0xFF;
-		new_insn[4] = (jmp_offset >> 24) & 0xFF;
+		u8 *jmp_insn = new_insn;
+		if (WARN_ON_ONCE(emit_jump(&jmp_insn, (void *)ret_addr, (u8 *)patch_ip)))
+			return;
 	} else {
 		new_insn[0] = 0xC3;
 		new_insn[1] = 0x90;
@@ -3949,7 +3947,7 @@ void bpf_die(struct bpf_prog *prog)
 		new_insn[4] = 0x90;
 	}
 
-	smp_text_poke_batch_add(prog->bpf_func + 4, new_insn, 5, NULL);
+	smp_text_poke_batch_add((void *)patch_ip, new_insn, 5, NULL);
 
 	if (prog->aux->func_cnt) {
 		for (int i = 0; i < prog->aux->func_cnt; i++) {
