@@ -24692,6 +24692,7 @@ exit:
 	return err;
 }
 
+/*
 static void debug_bpf_prog(char *str, struct bpf_prog *prog)
 {
 	if (strncmp(prog->aux->name, "bpf_prog", 8))
@@ -24747,6 +24748,7 @@ static void debug_bpf_prog(char *str, struct bpf_prog *prog)
 	}
 
 }
+*/
 
 
 static int fix_call_sites(struct bpf_verifier_env *env)
