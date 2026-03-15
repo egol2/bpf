@@ -3500,6 +3500,9 @@ static int check_subprogs(struct bpf_verifier_env *env)
 	for (i = 0; i < insn_cnt; i++) {
 		u8 code = insn[i].code;
 
+		if (!env->seen_throw_insn && is_bpf_throw_kfunc(&insn[i]))
+			env->seen_throw_insn = true;
+
 		if (code == (BPF_JMP | BPF_CALL) &&
 		    insn[i].src_reg == 0 &&
 		    insn[i].imm == BPF_FUNC_tail_call) {
@@ -3513,8 +3516,6 @@ static int check_subprogs(struct bpf_verifier_env *env)
 				subprog[cur_subprog].callee_regs_used[2] = true;
 			if (insn[i].dst_reg == BPF_REG_9 || insn[i].src_reg == BPF_REG_9)
 				subprog[cur_subprog].callee_regs_used[3] = true;
-			if (!env->seen_throw_insn && is_bpf_throw_kfunc(&insn[i]))
-				env->seen_throw_insn = true;
 			subprog[cur_subprog].tail_call_reachable = true;
 		}
 		if (BPF_CLASS(code) == BPF_LD &&
