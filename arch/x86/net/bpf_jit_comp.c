@@ -9,7 +9,10 @@
 #include <linux/filter.h>
 #include <linux/if_vlan.h>
 #include <linux/bpf.h>
+#include <linux/ktime.h>
 #include <linux/memory.h>
+#include <linux/rcupdate_trace.h>
+#include <linux/string.h>
 #include <linux/sort.h>
 #include <asm/extable.h>
 #include <asm/ftrace.h>
@@ -3914,11 +3917,12 @@ void in_place_patch_bpf_prog(struct bpf_prog *prog)
 	smp_text_poke_batch_finish();
 }
 
-void bpf_die(struct bpf_prog *prog)
+static void bpf_patch_terminated_prog_entry(struct bpf_prog *prog)
 {
 	u8 ret_jmp_size = 1;
 	unsigned long ret_addr;
 	unsigned long patch_ip = (unsigned long)prog->bpf_func;
+	char new_insn[5];
 
 	if (is_endbr((u32 *)patch_ip))
 		patch_ip += ENDBR_INSN_SIZE;
@@ -3934,7 +3938,6 @@ void bpf_die(struct bpf_prog *prog)
 	/*
 	 * Replacing 5 byte nop with jmp/ ret
 	 */
-	char new_insn[5];
 	if (cpu_wants_rethunk()) {
 		u8 *jmp_insn = new_insn;
 		if (WARN_ON_ONCE(emit_jump(&jmp_insn, (void *)ret_addr, (u8 *)patch_ip)))
@@ -3948,7 +3951,11 @@ void bpf_die(struct bpf_prog *prog)
 	}
 
 	smp_text_poke_batch_add((void *)patch_ip, new_insn, 5, NULL);
+	smp_text_poke_batch_finish();
+}
 
+static void bpf_patch_terminated_prog_runtime(struct bpf_prog *prog)
+{
 	if (prog->aux->func_cnt) {
 		for (int i = 0; i < prog->aux->func_cnt; i++) {
 			in_place_patch_bpf_prog(prog->aux->func[i]);
@@ -3956,7 +3963,62 @@ void bpf_die(struct bpf_prog *prog)
 	} else {
 		in_place_patch_bpf_prog(prog);
 	}
+}
 
+static bool fig7_term_prog_enabled(const struct bpf_prog *prog)
+{
+	if (!prog || !prog->aux)
+		return false;
+
+	return !strcmp(prog->aux->name, "tracepoint_exit_termination_stubbed") ||
+	       !strcmp(prog->aux->name, "tracepoint_exit_termination_instructions");
+}
+
+static u32 fig7_term_patch_sites(const struct bpf_prog *prog)
+{
+	if (!prog || !prog->term_states || !prog->term_states->patch_call_sites)
+		return 0;
+
+	return prog->term_states->patch_call_sites->call_sites_cnt;
+}
+
+void bpf_die(struct bpf_prog *prog)
+{
+	u64 start_ns = 0;
+	u64 end_ns;
+	u32 patch_sites = 0;
+	bool fig7_log = fig7_term_prog_enabled(prog);
+
+	if (fig7_log) {
+		start_ns = ktime_get_ns();
+		patch_sites = fig7_term_patch_sites(prog);
+		pr_info("FIG7_TERM_START prog_id=%u prog_name=%s patch_sites=%u ts_ns=%llu\n",
+			prog->aux->id, prog->aux->name, patch_sites, start_ns);
+	}
+
+	bpf_patch_terminated_prog_entry(prog);
+	bpf_patch_terminated_prog_runtime(prog);
+
+	if (!fig7_log)
+		return;
+
+	end_ns = ktime_get_ns();
+	pr_info("FIG7_TERM_END prog_id=%u prog_name=%s patch_sites=%u ts_ns=%llu delta_ns=%llu\n",
+		prog->aux->id, prog->aux->name, patch_sites, end_ns, end_ns - start_ns);
+}
+
+static void bpf_wait_for_prog_quiesce(struct bpf_prog *prog)
+{
+	/*
+	 * Async termination can arrive while other CPUs are still executing
+	 * the pre-patch body. Stop new entries first, then wait for the same
+	 * RCU flavor used by normal program teardown before rewriting helper
+	 * and callback call sites underneath those executions.
+	 */
+	if (prog->sleepable)
+		synchronize_rcu_tasks_trace();
+	else
+		synchronize_rcu();
 }
 
 void bpf_prog_termination_deferred(struct work_struct *work)
@@ -3965,7 +4027,9 @@ void bpf_prog_termination_deferred(struct work_struct *work)
 						 work);
 	struct bpf_prog *prog = term_states->prog;
 
-	bpf_die(prog);
+	bpf_patch_terminated_prog_entry(prog);
+	bpf_wait_for_prog_quiesce(prog);
+	bpf_patch_terminated_prog_runtime(prog);
 	
 	if(prog->aux->uterm_signal)
 		bpf_prog_put(prog);
