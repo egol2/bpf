@@ -1263,6 +1263,7 @@ void bpf_prog_pack_free(void *ptr, u32 size);
 void bpf_softlockup(u32 dur_s);
 bool bpf_term_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp);
 void bpf_prog_termination_deferred(struct work_struct *work);
+void bpf_prog_queue_termination(struct bpf_prog *prog, bool fast_patched);
 void bpf_die(struct bpf_prog *prog);
 void in_place_patch_bpf_prog(struct bpf_prog *prog);
 

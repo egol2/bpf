@@ -4027,15 +4027,15 @@ void bpf_prog_termination_deferred(struct work_struct *work)
 						 work);
 	struct bpf_prog *prog = term_states->prog;
 
-	bpf_patch_terminated_prog_entry(prog);
-	bpf_wait_for_prog_quiesce(prog);
-	bpf_patch_terminated_prog_runtime(prog);
-	
-	if(prog->aux->uterm_signal)
-		bpf_prog_put(prog);
-}
+	if (!test_bit(BPF_TERM_STATE_FAST_PATCHED, &term_states->state)) {
+		bpf_patch_terminated_prog_entry(prog);
+		bpf_wait_for_prog_quiesce(prog);
+		bpf_patch_terminated_prog_runtime(prog);
+	}
 
-static struct workqueue_struct *bpf_termination_wq;
+	bpf_prog_terminate_links(prog);
+	bpf_prog_put(prog);
+}
 
 bool bpf_term_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 {
@@ -4056,12 +4056,9 @@ bool bpf_term_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 	
 	if (!cookie) {
 		bpf_die(prog);
+		bpf_prog_queue_termination(prog, true);
 	} else {
-		bpf_termination_wq = alloc_workqueue("bpf_termination_wq", WQ_UNBOUND, 1);
-		if (!bpf_termination_wq)
-			pr_err("Failed to alloc workqueue for bpf termination.\n");
-
-		queue_work(bpf_termination_wq, &prog->term_states->work);
+		bpf_prog_queue_termination(prog, false);
 	}
 
 	/* Currently nested programs are not terminated together.

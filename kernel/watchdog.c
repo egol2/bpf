@@ -705,8 +705,8 @@ static int is_softlockup(unsigned long touch_ts,
 		 * Long running BPF programs can cause CPU's to stall.
 		 * So trigger fast path termination to terminate such BPF programs.
 		 */
-		if (time_after_eq(now, period_ts + get_softlockup_thresh() * 1 / 10))
-			bpf_softlockup(now - touch_ts);
+		// if (time_after_eq(now, period_ts + get_softlockup_thresh() * 1 / 10))
+			// bpf_softlockup(now - touch_ts);
 
 		/* Warn about unreasonable delays. */
 		if (time_after(now, period_ts + get_softlockup_thresh()))

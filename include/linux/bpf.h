@@ -1603,10 +1603,15 @@ struct bpf_term_patch_call_sites {
 	struct call_aux_states *call_states;
 };
 
+enum bpf_term_state_bits {
+	BPF_TERM_STATE_FAST_PATCHED = 0,
+};
+
 struct bpf_term_aux_states {
 	struct bpf_prog *prog;
 	struct work_struct work;
 	atomic_t bpf_die_in_progress;
+	unsigned long state;
 	struct bpf_term_patch_call_sites *patch_call_sites;
 };
 
@@ -1641,7 +1646,6 @@ struct bpf_prog_aux {
 	bool attach_btf_trace; /* true if attaching to BTF-enabled raw tp */
 	bool attach_tracing_prog; /* true if tracing another tracing program */
 	bool func_proto_unreliable;
-	bool uterm_signal;
 	bool tail_call_reachable;
 	bool xdp_has_frags;
 	bool exception_cb;
@@ -1830,12 +1834,14 @@ struct bpf_tracing_link {
 	struct bpf_tramp_link link;
 	struct bpf_trampoline *trampoline;
 	struct bpf_prog *tgt_prog;
+	unsigned long state;
 };
 
 struct bpf_raw_tp_link {
 	struct bpf_link link;
 	struct bpf_raw_event_map *btp;
 	u64 cookie;
+	unsigned long state;
 };
 
 struct bpf_link_primer {
@@ -2602,6 +2608,7 @@ void bpf_link_put(struct bpf_link *link);
 int bpf_link_new_fd(struct bpf_link *link);
 struct bpf_link *bpf_link_get_from_fd(u32 ufd);
 struct bpf_link *bpf_link_get_curr_or_next(u32 *id);
+void bpf_prog_terminate_links(struct bpf_prog *prog);
 
 void bpf_token_inc(struct bpf_token *token);
 void bpf_token_put(struct bpf_token *token);
@@ -2982,6 +2989,10 @@ static inline struct bpf_link *bpf_link_inc_not_zero(struct bpf_link *link)
 }
 
 static inline void bpf_link_put(struct bpf_link *link)
+{
+}
+
+static inline void bpf_prog_terminate_links(struct bpf_prog *prog)
 {
 }
 

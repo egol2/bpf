@@ -131,6 +131,16 @@ void __weak bpf_softlockup(u32 dur_s)
 	return;
 }
 
+void bpf_prog_queue_termination(struct bpf_prog *prog, bool fast_patched)
+{
+	if (fast_patched)
+		set_bit(BPF_TERM_STATE_FAST_PATCHED, &prog->term_states->state);
+
+	bpf_prog_inc(prog);
+	if (!queue_work(system_unbound_wq, &prog->term_states->work))
+		bpf_prog_put(prog);
+}
+
 struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flags)
 {
 	gfp_t gfp_flags = bpf_memcg_flags(GFP_KERNEL | __GFP_ZERO | gfp_extra_flags);

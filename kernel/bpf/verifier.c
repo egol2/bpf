@@ -21560,8 +21560,9 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	void *old_bpf_func;
 	int err, num_exentries;
 
-	if (env->subprog_cnt <= 1)
+	if (env->subprog_cnt <= 1) {
 		return 0;
+	}
 
 	for (i = 0, insn = prog->insnsi; i < prog->len; i++, insn++) {
 		if (!bpf_pseudo_func(insn) && !bpf_pseudo_call(insn))
@@ -21798,6 +21799,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 	prog->aux->real_func_cnt = env->subprog_cnt;
 	prog->aux->bpf_exception_cb = (void *)func[env->exception_callback_subprog]->bpf_func;
 	prog->aux->exception_boundary = func[0]->aux->exception_boundary;
+
 	bpf_prog_jit_attempt_done(prog);
 	return 0;
 out_free:
@@ -22121,10 +22123,11 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 	struct call_aux_states *call_states;
 
 	call_states = vzalloc(sizeof(*call_states) * prog->len);
-	printk("vzalloc size: %zu bytes\n", sizeof(*call_states) * prog->len);
-	
 	if (!call_states)
 		return -ENOMEM;
+	printk(KERN_INFO
+	       "BPF prog %s: saterm call_states vzalloc: %zu bytes\n",
+	       prog->aux->name, sizeof(*call_states) * prog->len);
 
 	if (env->seen_exception && !env->exception_callback_subprog) {
 		struct bpf_insn *patch = insn_buf;
