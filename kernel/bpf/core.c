@@ -111,9 +111,9 @@ int bpf_dummy_ret_non_zero(void)
 	return 1;
 }
 
-void __weak in_place_patch_bpf_prog(struct bpf_prog *prog)
+u32 __weak in_place_patch_bpf_prog(struct bpf_prog *prog)
 {
-	return;
+	return 0;
 }
 
 void __weak bpf_die(struct bpf_prog *prog)

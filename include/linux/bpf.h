@@ -1605,6 +1605,7 @@ struct bpf_term_patch_call_sites {
 
 enum bpf_term_state_bits {
 	BPF_TERM_STATE_FAST_PATCHED = 0,
+	BPF_TERM_STATE_DEAD,
 };
 
 struct bpf_term_aux_states {
@@ -1613,6 +1614,8 @@ struct bpf_term_aux_states {
 	atomic_t bpf_die_in_progress;
 	unsigned long state;
 	struct bpf_term_patch_call_sites *patch_call_sites;
+	u64 poke_runtime_ns;
+	u32 patch_sites;
 };
 
 struct bpf_prog_aux {
@@ -1780,6 +1783,7 @@ struct bpf_link {
 
 	u32 flags;
 	enum bpf_attach_type attach_type;
+	unsigned long state;
 
 	/* rcu is used before freeing, work can be used to schedule that
 	 * RCU-based freeing before that, so they never overlap
@@ -1793,6 +1797,7 @@ struct bpf_link {
 	 * link's semantics is determined by target attach hook
 	 */
 	bool sleepable;
+	struct mutex mutex;
 };
 
 struct bpf_link_ops {

@@ -2395,6 +2395,8 @@ static int bpf_prog_release(struct inode *inode, struct file *filp)
 	return 0;
 }
 
+static bool bpf_prog_is_terminated(const struct bpf_prog *prog);
+
 struct bpf_prog_kstats {
 	u64 nsecs;
 	u64 cnt;
@@ -2446,6 +2448,18 @@ static void bpf_prog_show_fdinfo(struct seq_file *m, struct file *filp)
 	char prog_tag[sizeof(prog->tag) * 2 + 1] = { };
 	struct bpf_prog_kstats stats;
 
+	if (bpf_prog_is_terminated(prog)) {
+		seq_puts(m, "prog_dead:\t1\n");
+		if (prog->term_states) {
+			seq_printf(m,
+				   "term_poke_runtime_ns:\t%llu\n"
+				   "term_patch_sites:\t%u\n",
+				   READ_ONCE(prog->term_states->poke_runtime_ns),
+				   READ_ONCE(prog->term_states->patch_sites));
+		}
+		return;
+	}
+
 	bpf_prog_get_stats(prog, &stats);
 	bin2hex(prog_tag, prog->tag, sizeof(prog->tag));
 	seq_printf(m,
@@ -2467,6 +2481,13 @@ static void bpf_prog_show_fdinfo(struct seq_file *m, struct file *filp)
 		   stats.cnt,
 		   stats.misses,
 		   prog->aux->verified_insns);
+	if (prog->term_states) {
+		seq_printf(m,
+			   "term_poke_runtime_ns:\t%llu\n"
+			   "term_patch_sites:\t%u\n",
+			   READ_ONCE(prog->term_states->poke_runtime_ns),
+			   READ_ONCE(prog->term_states->patch_sites));
+	}
 }
 #endif
 
@@ -2555,6 +2576,8 @@ static struct bpf_prog *__bpf_prog_get(u32 ufd, enum bpf_prog_type *attach_type,
 		return ERR_PTR(-EINVAL);
 
 	prog = fd_file(f)->private_data;
+	if (bpf_prog_is_terminated(prog))
+		return ERR_PTR(-ENOENT);
 	if (!bpf_prog_get_ok(prog, attach_type, attach_drv))
 		return ERR_PTR(-EINVAL);
 
@@ -3110,6 +3133,8 @@ void bpf_link_init_sleepable(struct bpf_link *link, enum bpf_link_type type,
 	link->ops = ops;
 	link->prog = prog;
 	link->attach_type = attach_type;
+	link->state = 0;
+	mutex_init(&link->mutex);
 }
 
 void bpf_link_init(struct bpf_link *link, enum bpf_link_type type,
@@ -3127,6 +3152,21 @@ static void bpf_link_free_id(int id)
 	spin_lock_bh(&link_idr_lock);
 	idr_remove(&link_idr, id);
 	spin_unlock_bh(&link_idr_lock);
+}
+
+static bool bpf_prog_is_terminated(const struct bpf_prog *prog)
+{
+	return prog && prog->term_states &&
+	       test_bit(BPF_TERM_STATE_DEAD, &prog->term_states->state);
+}
+
+enum bpf_link_state_bits {
+	BPF_LINK_STATE_DEAD = 0,
+};
+
+static bool bpf_link_is_terminated(const struct bpf_link *link)
+{
+	return test_bit(BPF_LINK_STATE_DEAD, &link->state);
 }
 
 /* Clean up bpf_link and corresponding anon_inode file and FD. After
@@ -3255,10 +3295,13 @@ static const char *bpf_link_type_strs[] = {
 
 static void bpf_link_show_fdinfo(struct seq_file *m, struct file *filp)
 {
-	const struct bpf_link *link = filp->private_data;
-	const struct bpf_prog *prog = link->prog;
+	struct bpf_link *link = filp->private_data;
 	enum bpf_link_type type = link->type;
+	const struct bpf_prog *prog;
 	char prog_tag[sizeof(prog->tag) * 2 + 1] = { };
+
+	mutex_lock(&link->mutex);
+	prog = link->prog;
 
 	if (type < ARRAY_SIZE(bpf_link_type_strs) && bpf_link_type_strs[type]) {
 		if (link->type == BPF_LINK_TYPE_KPROBE_MULTI)
@@ -3271,9 +3314,14 @@ static void bpf_link_show_fdinfo(struct seq_file *m, struct file *filp)
 			seq_printf(m, "link_type:\t%s\n", bpf_link_type_strs[type]);
 	} else {
 		WARN_ONCE(1, "missing BPF_LINK_TYPE(...) for link type %u\n", type);
-		seq_printf(m, "link_type:\t<%u>\n", type);
+			seq_printf(m, "link_type:\t<%u>\n", type);
 	}
 	seq_printf(m, "link_id:\t%u\n", link->id);
+
+	if (bpf_link_is_terminated(link)) {
+		seq_puts(m, "link_dead:\t1\n");
+		goto out_unlock;
+	}
 
 	if (prog) {
 		bin2hex(prog_tag, prog->tag, sizeof(prog->tag));
@@ -3285,6 +3333,9 @@ static void bpf_link_show_fdinfo(struct seq_file *m, struct file *filp)
 	}
 	if (link->ops->show_fdinfo)
 		link->ops->show_fdinfo(link, m);
+
+out_unlock:
+	mutex_unlock(&link->mutex);
 }
 #endif
 
@@ -3292,6 +3343,10 @@ static __poll_t bpf_link_poll(struct file *file, struct poll_table_struct *pts)
 {
 	struct bpf_link *link = file->private_data;
 
+	if (bpf_link_is_terminated(link))
+		return EPOLLHUP;
+	if (!link->ops->poll)
+		return 0;
 	return link->ops->poll(file, pts);
 }
 
@@ -3403,9 +3458,36 @@ struct bpf_link *bpf_link_get_from_fd(u32 ufd)
 
 	link = fd_file(f)->private_data;
 	bpf_link_inc(link);
+	if (bpf_link_is_terminated(link)) {
+		bpf_link_put_direct(link);
+		return ERR_PTR(-ENOENT);
+	}
 	return link;
 }
 EXPORT_SYMBOL_NS(bpf_link_get_from_fd, "BPF_INTERNAL");
+
+static void bpf_link_terminate(struct bpf_link *link, struct bpf_prog *prog)
+{
+	struct bpf_prog *link_prog;
+
+	mutex_lock(&link->mutex);
+	if (bpf_link_is_terminated(link) || link->prog != prog) {
+		mutex_unlock(&link->mutex);
+		return;
+	}
+
+	set_bit(BPF_LINK_STATE_DEAD, &link->state);
+	bpf_link_free_id(link->id);
+	link->id = 0;
+	if (link->ops->release)
+		link->ops->release(link);
+	link_prog = link->prog;
+	link->prog = NULL;
+	mutex_unlock(&link->mutex);
+
+	if (link_prog)
+		bpf_prog_put(link_prog);
+}
 
 enum bpf_link_detach_state_bits {
 	BPF_LINK_DETACHED = 0,
@@ -3413,6 +3495,8 @@ enum bpf_link_detach_state_bits {
 
 static int __bpf_tracing_link_detach(struct bpf_tracing_link *tr_link)
 {
+	if (!tr_link->trampoline)
+		return 0;
 	if (test_and_set_bit(BPF_LINK_DETACHED, &tr_link->state))
 		return 0;
 
@@ -3436,11 +3520,16 @@ static void bpf_tracing_link_release(struct bpf_link *link)
 
 	WARN_ON_ONCE(__bpf_tracing_link_detach(tr_link));
 
-	bpf_trampoline_put(tr_link->trampoline);
+	if (tr_link->trampoline) {
+		bpf_trampoline_put(tr_link->trampoline);
+		tr_link->trampoline = NULL;
+	}
 
 	/* tgt_prog is NULL if target is a kernel function */
-	if (tr_link->tgt_prog)
+	if (tr_link->tgt_prog) {
 		bpf_prog_put(tr_link->tgt_prog);
+		tr_link->tgt_prog = NULL;
+	}
 }
 
 static void bpf_tracing_link_dealloc(struct bpf_link *link)
@@ -3694,6 +3783,8 @@ out_put_prog:
 
 static int __bpf_raw_tp_link_detach(struct bpf_raw_tp_link *raw_tp)
 {
+	if (!raw_tp->btp)
+		return 0;
 	if (test_and_set_bit(BPF_LINK_DETACHED, &raw_tp->state))
 		return 0;
 
@@ -3714,7 +3805,10 @@ static void bpf_raw_tp_link_release(struct bpf_link *link)
 		container_of(link, struct bpf_raw_tp_link, link);
 
 	WARN_ON_ONCE(__bpf_raw_tp_link_detach(raw_tp));
-	bpf_put_raw_tracepoint(raw_tp->btp);
+	if (raw_tp->btp) {
+		bpf_put_raw_tracepoint(raw_tp->btp);
+		raw_tp->btp = NULL;
+	}
 }
 
 static void bpf_raw_tp_link_dealloc(struct bpf_link *link)
@@ -3796,7 +3890,11 @@ struct bpf_perf_link {
 
 static int __bpf_perf_link_detach(struct bpf_perf_link *perf_link)
 {
-	struct perf_event *event = perf_link->perf_file->private_data;
+	struct perf_event *event;
+
+	if (!perf_link->perf_file)
+		return 0;
+	event = perf_link->perf_file->private_data;
 
 	if (test_and_set_bit(BPF_LINK_DETACHED, &perf_link->state))
 		return 0;
@@ -3817,7 +3915,10 @@ static void bpf_perf_link_release(struct bpf_link *link)
 	struct bpf_perf_link *perf_link = container_of(link, struct bpf_perf_link, link);
 
 	WARN_ON_ONCE(__bpf_perf_link_detach(perf_link));
-	fput(perf_link->perf_file);
+	if (perf_link->perf_file) {
+		fput(perf_link->perf_file);
+		perf_link->perf_file = NULL;
+	}
 }
 
 static void bpf_perf_link_dealloc(struct bpf_link *link)
@@ -5015,6 +5116,9 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	err = bpf_check_uarg_tail_zero(USER_BPFPTR(uinfo), sizeof(info), info_len);
 	if (err)
 		return err;
+	/* Temporary Figure 7 measurement exception: allow a held prog FD to
+	 * report final run_time_ns/run_cnt after termination.
+	 */
 	info_len = min_t(u32, sizeof(info), info_len);
 
 	memset(&info, 0, sizeof(info));
@@ -5365,26 +5469,35 @@ static int bpf_link_get_info_by_fd(struct file *file,
 		return err;
 	info_len = min_t(u32, sizeof(info), info_len);
 
-	memset(&info, 0, sizeof(info));
-	if (copy_from_user(&info, uinfo, info_len))
-		return -EFAULT;
-
-	info.type = link->type;
-	info.id = link->id;
-	if (link->prog)
-		info.prog_id = link->prog->aux->id;
-
-	if (link->ops->fill_link_info) {
-		err = link->ops->fill_link_info(link, &info);
-		if (err)
-			return err;
+	mutex_lock(&link->mutex);
+	if (bpf_link_is_terminated(link)) {
+		err = -ENOENT;
+		goto out_unlock;
 	}
 
-	if (copy_to_user(uinfo, &info, info_len) ||
-	    put_user(info_len, &uattr->info.info_len))
-		return -EFAULT;
+	memset(&info, 0, sizeof(info));
+	if (copy_from_user(&info, uinfo, info_len))
+		err = -EFAULT;
+	else {
+		info.type = link->type;
+		info.id = link->id;
+		if (link->prog)
+			info.prog_id = link->prog->aux->id;
 
-	return 0;
+		if (link->ops->fill_link_info) {
+			err = link->ops->fill_link_info(link, &info);
+			if (err)
+				goto out_unlock;
+		}
+
+		if (copy_to_user(uinfo, &info, info_len) ||
+		    put_user(info_len, &uattr->info.info_len))
+			err = -EFAULT;
+	}
+
+out_unlock:
+	mutex_unlock(&link->mutex);
+	return err;
 }
 
 
@@ -5568,6 +5681,13 @@ static int bpf_task_fd_query(const union bpf_attr *attr,
 	if (file->f_op == &bpf_link_fops || file->f_op == &bpf_link_fops_poll) {
 		struct bpf_link *link = file->private_data;
 
+		mutex_lock(&link->mutex);
+		if (bpf_link_is_terminated(link)) {
+			mutex_unlock(&link->mutex);
+			err = -ENOENT;
+			goto put_file;
+		}
+
 		if (link->ops == &bpf_raw_tp_link_lops) {
 			struct bpf_raw_tp_link *raw_tp =
 				container_of(link, struct bpf_raw_tp_link, link);
@@ -5577,8 +5697,10 @@ static int bpf_task_fd_query(const union bpf_attr *attr,
 						     raw_tp->link.prog->aux->id,
 						     BPF_FD_TYPE_RAW_TRACEPOINT,
 						     btp->tp->name, 0, 0);
+			mutex_unlock(&link->mutex);
 			goto put_file;
 		}
+		mutex_unlock(&link->mutex);
 		goto out_not_supp;
 	}
 
@@ -5816,15 +5938,21 @@ static int link_update(union bpf_attr *attr)
 	if (IS_ERR(link))
 		return PTR_ERR(link);
 
+	mutex_lock(&link->mutex);
+	if (bpf_link_is_terminated(link)) {
+		ret = -ENOENT;
+		goto out_unlock_link;
+	}
+
 	if (link->ops->update_map) {
 		ret = link_update_map(link, attr);
-		goto out_put_link;
+		goto out_unlock_link;
 	}
 
 	new_prog = bpf_prog_get(attr->link_update.new_prog_fd);
 	if (IS_ERR(new_prog)) {
 		ret = PTR_ERR(new_prog);
-		goto out_put_link;
+		goto out_unlock_link;
 	}
 
 	if (flags & BPF_F_REPLACE) {
@@ -5849,7 +5977,8 @@ out_put_progs:
 		bpf_prog_put(old_prog);
 	if (ret)
 		bpf_prog_put(new_prog);
-out_put_link:
+out_unlock_link:
+	mutex_unlock(&link->mutex);
 	bpf_link_put_direct(link);
 	return ret;
 }
@@ -5868,10 +5997,14 @@ static int link_detach(union bpf_attr *attr)
 	if (IS_ERR(link))
 		return PTR_ERR(link);
 
-	if (link->ops->detach)
+	mutex_lock(&link->mutex);
+	if (bpf_link_is_terminated(link))
+		ret = -ENOENT;
+	else if (link->ops->detach)
 		ret = link->ops->detach(link);
 	else
 		ret = -EOPNOTSUPP;
+	mutex_unlock(&link->mutex);
 
 	bpf_link_put_direct(link);
 	return ret;
@@ -5929,10 +6062,13 @@ void bpf_prog_terminate_links(struct bpf_prog *prog)
 	struct bpf_link *link;
 	u32 id = 1;
 
-	while ((link = bpf_link_get_curr_or_next(&id))) {
-		if (link->prog == prog && link->ops->detach)
-			WARN_ON_ONCE(link->ops->detach(link));
+	if (!bpf_prog_is_terminated(prog)) {
+		set_bit(BPF_TERM_STATE_DEAD, &prog->term_states->state);
+		bpf_prog_free_id(prog);
+	}
 
+	while ((link = bpf_link_get_curr_or_next(&id))) {
+		bpf_link_terminate(link, prog);
 		id++;
 		bpf_link_put(link);
 	}
@@ -6034,7 +6170,15 @@ static int bpf_iter_create(union bpf_attr *attr)
 	if (IS_ERR(link))
 		return PTR_ERR(link);
 
+	mutex_lock(&link->mutex);
+	if (bpf_link_is_terminated(link)) {
+		mutex_unlock(&link->mutex);
+		bpf_link_put_direct(link);
+		return -ENOENT;
+	}
+
 	err = bpf_iter_new_fd(link);
+	mutex_unlock(&link->mutex);
 	bpf_link_put_direct(link);
 
 	return err;

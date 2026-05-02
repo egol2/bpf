@@ -3872,17 +3872,28 @@ void arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp, u64 bp
 #endif
 }
 
-void in_place_patch_bpf_prog(struct bpf_prog *prog)
+u32 in_place_patch_bpf_prog(struct bpf_prog *prog)
 {
+	struct bpf_term_patch_call_sites *call_sites;
 	struct call_aux_states *call_states;
 	unsigned long new_target;
 	unsigned char *addr;
+	u32 call_sites_cnt = 0;
+	u32 queued_pokes = 0;
 	u8 ret_jmp_size = 1;
 	if (cpu_wants_rethunk()) {
 		ret_jmp_size = 5;
 	}
-	call_states = prog->term_states->patch_call_sites->call_states;
-	for (int i = 0; i < prog->term_states->patch_call_sites->call_sites_cnt; i++) {
+
+	if (prog->term_states && prog->term_states->patch_call_sites) {
+		call_sites = prog->term_states->patch_call_sites;
+		call_states = call_sites->call_states;
+		call_sites_cnt = call_sites->call_sites_cnt;
+	} else {
+		call_states = NULL;
+	}
+
+	for (int i = 0; i < call_sites_cnt; i++) {
 		if (call_states[i].is_bpf_loop_cb_inline) {
 			new_target = (unsigned long) bpf_loop_term_callback;	
 		} else if (call_states[i].is_helper_kfunc_ret_non_zero) {
@@ -3902,6 +3913,7 @@ void in_place_patch_bpf_prog(struct bpf_prog *prog)
 		new_insn[4] = (new_rel >> 24) & 0xFF;
 
 		smp_text_poke_batch_add(addr, new_insn, 5 /* call instruction len */, NULL);
+		queued_pokes++;
 	}
 
 	if (prog->aux->is_bpf_loop_cb_non_inline) {
@@ -3910,11 +3922,15 @@ void in_place_patch_bpf_prog(struct bpf_prog *prog)
 		char old_insn[5] = { 0x0F, 0x1F, 0x44, 0x00, 0x00 };
 		smp_text_poke_batch_add(prog->bpf_func + prog->jited_len - 
 				(1 + ret_jmp_size) /* leave, jmp/ ret */ - 5 /* nop size */, new_insn, 5 /* mov eax, 1 */, old_insn);
+		queued_pokes++;
 	}
 
 
 	/* flush all text poke calls */
-	smp_text_poke_batch_finish();
+	if (queued_pokes)
+		smp_text_poke_batch_finish();
+
+	return queued_pokes;
 }
 
 static void bpf_patch_terminated_prog_entry(struct bpf_prog *prog)
@@ -3954,57 +3970,36 @@ static void bpf_patch_terminated_prog_entry(struct bpf_prog *prog)
 	smp_text_poke_batch_finish();
 }
 
-static void bpf_patch_terminated_prog_runtime(struct bpf_prog *prog)
+static u32 bpf_patch_terminated_prog_runtime(struct bpf_prog *prog)
 {
+	u32 patch_sites = 0;
+
 	if (prog->aux->func_cnt) {
 		for (int i = 0; i < prog->aux->func_cnt; i++) {
-			in_place_patch_bpf_prog(prog->aux->func[i]);
+			patch_sites += in_place_patch_bpf_prog(prog->aux->func[i]);
 		}
 	} else {
-		in_place_patch_bpf_prog(prog);
+		patch_sites += in_place_patch_bpf_prog(prog);
 	}
-}
 
-static bool fig7_term_prog_enabled(const struct bpf_prog *prog)
-{
-	if (!prog || !prog->aux)
-		return false;
-
-	return !strcmp(prog->aux->name, "tracepoint_exit_termination_stubbed") ||
-	       !strcmp(prog->aux->name, "tracepoint_exit_termination_instructions");
-}
-
-static u32 fig7_term_patch_sites(const struct bpf_prog *prog)
-{
-	if (!prog || !prog->term_states || !prog->term_states->patch_call_sites)
-		return 0;
-
-	return prog->term_states->patch_call_sites->call_sites_cnt;
+	return patch_sites;
 }
 
 void bpf_die(struct bpf_prog *prog)
 {
-	u64 start_ns = 0;
-	u64 end_ns;
-	u32 patch_sites = 0;
-	bool fig7_log = fig7_term_prog_enabled(prog);
-
-	if (fig7_log) {
-		start_ns = ktime_get_ns();
-		patch_sites = fig7_term_patch_sites(prog);
-		pr_info("FIG7_TERM_START prog_id=%u prog_name=%s patch_sites=%u ts_ns=%llu\n",
-			prog->aux->id, prog->aux->name, patch_sites, start_ns);
-	}
+	u64 poke_start_ns, poke_end_ns;
+	u32 patch_sites;
 
 	bpf_patch_terminated_prog_entry(prog);
-	bpf_patch_terminated_prog_runtime(prog);
+	poke_start_ns = ktime_get_ns();
+	patch_sites = bpf_patch_terminated_prog_runtime(prog);
+	poke_end_ns = ktime_get_ns();
 
-	if (!fig7_log)
-		return;
-
-	end_ns = ktime_get_ns();
-	pr_info("FIG7_TERM_END prog_id=%u prog_name=%s patch_sites=%u ts_ns=%llu delta_ns=%llu\n",
-		prog->aux->id, prog->aux->name, patch_sites, end_ns, end_ns - start_ns);
+	if (prog->term_states) {
+		WRITE_ONCE(prog->term_states->poke_runtime_ns,
+			   poke_end_ns - poke_start_ns);
+		WRITE_ONCE(prog->term_states->patch_sites, patch_sites);
+	}
 }
 
 static void bpf_wait_for_prog_quiesce(struct bpf_prog *prog)
@@ -4069,14 +4064,10 @@ bool bpf_term_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 	return false;
 }
 
-struct bpf_term_dummy {
-	u32 dummy;
-};
-
 void bpf_softlockup(u32 dur_s)
 {
-	struct bpf_term_dummy ctx = {};
-	arch_bpf_stack_walk(bpf_term_stack_walker, &ctx);
+	(void)dur_s;
+	arch_bpf_stack_walk(bpf_term_stack_walker, NULL);
 }
 
 void bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,
